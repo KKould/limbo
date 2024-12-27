@@ -15,7 +15,7 @@ pub fn translate_delete(
     database_header: Rc<RefCell<DatabaseHeader>>,
     connection: Weak<Connection>,
 ) -> Result<Program> {
-    let delete_plan = prepare_delete_plan(schema, tbl_name, where_clause, limit)?;
-    let optimized_plan = optimize_plan(delete_plan)?;
-    emit_program(database_header, optimized_plan, connection)
+    let mut delete_plan = prepare_delete_plan(schema, tbl_name, where_clause, limit)?;
+    optimize_plan(&mut delete_plan)?;
+    emit_program(database_header, delete_plan, connection)
 }

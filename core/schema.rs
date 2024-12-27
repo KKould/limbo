@@ -211,6 +211,10 @@ impl PseudoTable {
         Self { columns: vec![] }
     }
 
+    pub fn new_with_columns(columns: Vec<Column>) -> Self {
+        Self { columns }
+    }
+
     pub fn add_column(&mut self, name: &str, ty: Type, primary_key: bool) {
         self.columns.push(Column {
             name: normalize_ident(name),

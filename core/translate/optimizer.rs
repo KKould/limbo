@@ -6,13 +6,14 @@ use crate::{schema::Index, Result};
 
 use super::plan::{
     get_table_ref_bitmask_for_ast_expr, get_table_ref_bitmask_for_operator, BTreeTableReference,
-    DeletePlan, Direction, IterationDirection, Plan, Search, SelectPlan, SourceOperator,
+    DeletePlan, Direction, IterationDirection, Plan, PseudoTableReference, Search, SelectPlan,
+    SourceOperator, SourceReference,
 };
 
-pub fn optimize_plan(plan: Plan) -> Result<Plan> {
+pub fn optimize_plan(plan: &mut Plan) -> Result<()> {
     match plan {
-        Plan::Select(plan) => optimize_select_plan(plan).map(Plan::Select),
-        Plan::Delete(plan) => optimize_delete_plan(plan).map(Plan::Delete),
+        Plan::Select(plan) => optimize_select_plan(plan),
+        Plan::Delete(plan) => optimize_delete_plan(plan),
     }
 }
 
@@ -21,13 +22,14 @@ pub fn optimize_plan(plan: Plan) -> Result<Plan> {
  * TODO: these could probably be done in less passes,
  * but having them separate makes them easier to understand
  */
-fn optimize_select_plan(mut plan: SelectPlan) -> Result<SelectPlan> {
+fn optimize_select_plan(plan: &mut SelectPlan) -> Result<()> {
+    optimize_subqueries(&mut plan.source)?;
     eliminate_between(&mut plan.source, &mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constants(&mut plan.source, &mut plan.where_clause)?
     {
         plan.contains_constant_false_condition = true;
-        return Ok(plan);
+        return Ok(());
     }
 
     push_predicates(
@@ -49,16 +51,16 @@ fn optimize_select_plan(mut plan: SelectPlan) -> Result<SelectPlan> {
         &plan.available_indexes,
     )?;
 
-    Ok(plan)
+    Ok(())
 }
 
-fn optimize_delete_plan(mut plan: DeletePlan) -> Result<DeletePlan> {
+fn optimize_delete_plan(plan: &mut DeletePlan) -> Result<()> {
     eliminate_between(&mut plan.source, &mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constants(&mut plan.source, &mut plan.where_clause)?
     {
         plan.contains_constant_false_condition = true;
-        return Ok(plan);
+        return Ok(());
     }
 
     use_indexes(
@@ -67,13 +69,28 @@ fn optimize_delete_plan(mut plan: DeletePlan) -> Result<DeletePlan> {
         &plan.available_indexes,
     )?;
 
-    Ok(plan)
+    Ok(())
+}
+
+fn optimize_subqueries(operator: &mut SourceOperator) -> Result<()> {
+    match operator {
+        SourceOperator::Subquery { plan, .. } => {
+            optimize_select_plan(&mut *plan)?;
+            Ok(())
+        }
+        SourceOperator::Join { left, right, .. } => {
+            optimize_subqueries(left)?;
+            optimize_subqueries(right)?;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn _operator_is_already_ordered_by(
     operator: &mut SourceOperator,
     key: &mut ast::Expr,
-    referenced_tables: &[BTreeTableReference],
+    referenced_tables: &[SourceReference],
     available_indexes: &Vec<Rc<Index>>,
 ) -> Result<bool> {
     match operator {
@@ -109,7 +126,7 @@ fn _operator_is_already_ordered_by(
 fn eliminate_unnecessary_orderby(
     operator: &mut SourceOperator,
     order_by: &mut Option<Vec<(ast::Expr, Direction)>>,
-    referenced_tables: &[BTreeTableReference],
+    referenced_tables: &[SourceReference],
     available_indexes: &Vec<Rc<Index>>,
 ) -> Result<()> {
     if order_by.is_none() {
@@ -141,10 +158,11 @@ fn eliminate_unnecessary_orderby(
  */
 fn use_indexes(
     operator: &mut SourceOperator,
-    referenced_tables: &[BTreeTableReference],
+    referenced_tables: &[SourceReference],
     available_indexes: &[Rc<Index>],
 ) -> Result<()> {
     match operator {
+        SourceOperator::Subquery { .. } => Ok(()),
         SourceOperator::Search { .. } => Ok(()),
         SourceOperator::Scan {
             table_reference,
@@ -161,10 +179,7 @@ fn use_indexes(
                 let f = fs[i].take_ownership();
                 let table_index = referenced_tables
                     .iter()
-                    .position(|t| {
-                        Rc::ptr_eq(&t.table, &table_reference.table)
-                            && t.table_identifier == table_reference.table_identifier
-                    })
+                    .position(|t| t.identifier() == table_reference.table_identifier)
                     .unwrap();
                 match try_extract_index_search_expression(
                     f,
@@ -229,6 +244,7 @@ fn eliminate_constants(
         }
     }
     match operator {
+        SourceOperator::Subquery { .. } => Ok(ConstantConditionEliminationResult::Continue),
         SourceOperator::Join {
             left,
             right,
@@ -334,7 +350,7 @@ fn eliminate_constants(
 fn push_predicates(
     operator: &mut SourceOperator,
     where_clause: &mut Option<Vec<ast::Expr>>,
-    referenced_tables: &Vec<BTreeTableReference>,
+    referenced_tables: &Vec<SourceReference>,
 ) -> Result<()> {
     // First try to push down any predicates from the WHERE clause
     if let Some(predicates) = where_clause {
@@ -357,6 +373,7 @@ fn push_predicates(
     }
 
     match operator {
+        SourceOperator::Subquery { .. } => Ok(()),
         SourceOperator::Join {
             left,
             right,
@@ -424,9 +441,70 @@ fn push_predicates(
 fn push_predicate(
     operator: &mut SourceOperator,
     predicate: ast::Expr,
-    referenced_tables: &Vec<BTreeTableReference>,
+    referenced_tables: &Vec<SourceReference>,
 ) -> Result<Option<ast::Expr>> {
     match operator {
+        SourceOperator::Subquery {
+            predicates,
+            table_reference,
+            ..
+        } => {
+            // **TODO**: we are currently just evaluating the predicate after the subquery yields,
+            // and not trying to do anythign more sophisticated.
+            // E.g. literally: SELECT * FROM (SELECT * FROM t1) sub WHERE sub.col = 'foo'
+            //
+            // It is possible, and not overly difficult, to determine that we can also push the
+            // predicate into the subquery coroutine itself before it yields. The above query would
+            // effectively become: SELECT * FROM (SELECT * FROM t1 WHERE col = 'foo') sub
+            //
+            // This matters more in cases where the subquery builds some kind of sorter/index in memory
+            // (or on disk) and in those cases pushing the predicate down to the coroutine will make the
+            // subquery produce less intermediate data. In cases where no intermediate data structures are
+            // built, it doesn't matter.
+            //
+            // Moreover, in many cases the subquery can even be completely eliminated, e.g. the above original
+            // query would become: SELECT * FROM t1 WHERE col = 'foo' without the subquery.
+            // **END TODO**
+
+            // Find position of this subquery in referenced_tables array
+            let subquery_index = referenced_tables
+                .iter()
+                .position(|t| match t {
+                    SourceReference::Subquery {
+                        table_reference:
+                            PseudoTableReference {
+                                table_identifier, ..
+                            },
+                        ..
+                    } => *table_identifier == table_reference.table_identifier,
+                    _ => false,
+                })
+                .unwrap();
+
+            // Get bitmask showing which tables this predicate references
+            let predicate_bitmask =
+                get_table_ref_bitmask_for_ast_expr(referenced_tables, &predicate)?;
+
+            // Each table has a bit position based on join order from left to right
+            // e.g. in SELECT * FROM t1 JOIN t2 JOIN t3
+            // t1 is position 0 (001), t2 is position 1 (010), t3 is position 2 (100)
+            // To push a predicate to a given table, it can only reference that table and tables to its left
+            // Example: For table t2 at position 1 (bit 010):
+            // - Can push: 011 (t2 + t1), 001 (just t1), 010 (just t2)
+            // - Can't push: 110 (t2 + t3)
+            let next_table_on_the_right_in_join_bitmask = 1 << (subquery_index + 1);
+            if predicate_bitmask >= next_table_on_the_right_in_join_bitmask {
+                return Ok(Some(predicate));
+            }
+
+            if predicates.is_none() {
+                predicates.replace(vec![predicate]);
+            } else {
+                predicates.as_mut().unwrap().push(predicate);
+            }
+
+            Ok(None)
+        }
         SourceOperator::Scan {
             predicates,
             table_reference,
@@ -435,7 +513,16 @@ fn push_predicate(
             // Find position of this table in referenced_tables array
             let table_index = referenced_tables
                 .iter()
-                .position(|t| t.table_identifier == table_reference.table_identifier)
+                .position(|t| match t {
+                    SourceReference::BTreeTable {
+                        table_reference:
+                            BTreeTableReference {
+                                table_identifier, ..
+                            },
+                        ..
+                    } => *table_identifier == table_reference.table_identifier,
+                    SourceReference::Subquery { .. } => false,
+                })
                 .unwrap();
 
             // Get bitmask showing which tables this predicate references
@@ -595,7 +682,7 @@ pub trait Optimizable {
     fn check_index_scan(
         &mut self,
         table_index: usize,
-        referenced_tables: &[BTreeTableReference],
+        referenced_tables: &[SourceReference],
         available_indexes: &[Rc<Index>],
     ) -> Result<Option<usize>>;
 }
@@ -614,7 +701,7 @@ impl Optimizable for ast::Expr {
     fn check_index_scan(
         &mut self,
         table_index: usize,
-        referenced_tables: &[BTreeTableReference],
+        referenced_tables: &[SourceReference],
         available_indexes: &[Rc<Index>],
     ) -> Result<Option<usize>> {
         match self {
@@ -623,12 +710,15 @@ impl Optimizable for ast::Expr {
                     return Ok(None);
                 }
                 for (idx, index) in available_indexes.iter().enumerate() {
-                    if index.table_name == referenced_tables[*table].table.name {
-                        let column = referenced_tables[*table]
-                            .table
-                            .columns
-                            .get(*column)
-                            .unwrap();
+                    let SourceReference::BTreeTable {
+                        table_reference: BTreeTableReference { table, .. },
+                        ..
+                    } = &referenced_tables[*table]
+                    else {
+                        continue;
+                    };
+                    if index.table_name == table.name {
+                        let column = table.columns.get(*column).unwrap();
                         if index.columns.first().unwrap().name == column.name {
                             return Ok(Some(idx));
                         }
@@ -793,7 +883,7 @@ pub enum Either<T, U> {
 pub fn try_extract_index_search_expression(
     expr: ast::Expr,
     table_index: usize,
-    referenced_tables: &[BTreeTableReference],
+    referenced_tables: &[SourceReference],
     available_indexes: &[Rc<Index>],
 ) -> Result<Either<ast::Expr, Search>> {
     match expr {

@@ -15,7 +15,7 @@ pub fn translate_select(
     database_header: Rc<RefCell<DatabaseHeader>>,
     connection: Weak<Connection>,
 ) -> Result<Program> {
-    let select_plan = prepare_select_plan(schema, select)?;
-    let optimized_plan = optimize_plan(select_plan)?;
-    emit_program(database_header, optimized_plan, connection)
+    let mut select_plan = prepare_select_plan(schema, select)?;
+    optimize_plan(&mut select_plan)?;
+    emit_program(database_header, select_plan, connection)
 }

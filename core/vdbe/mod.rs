@@ -2275,8 +2275,13 @@ impl Program {
                     jump_on_definition,
                     start_offset,
                 } => {
+                    assert!(*jump_on_definition >= 0);
                     state.registers[*yield_reg] = OwnedValue::Integer(*start_offset);
-                    state.pc = *jump_on_definition;
+                    state.pc = if *jump_on_definition == 0 {
+                        state.pc + 1
+                    } else {
+                        *jump_on_definition
+                    };
                 }
                 Insn::EndCoroutine { yield_reg } => {
                     if let OwnedValue::Integer(pc) = state.registers[*yield_reg] {
@@ -2299,7 +2304,10 @@ impl Program {
                                 (pc, OwnedValue::Integer(state.pc + 1));
                         }
                     } else {
-                        unreachable!();
+                        unreachable!(
+                            "yield_reg {} contains non-integer value: {:?}",
+                            *yield_reg, state.registers[*yield_reg]
+                        );
                     }
                 }
                 Insn::InsertAsync {

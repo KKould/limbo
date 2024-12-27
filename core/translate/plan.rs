@@ -5,34 +5,44 @@ use std::{
     rc::Rc,
 };
 
-use crate::translate::plan::Plan::{Delete, Select};
 use crate::{
     function::AggFunc,
     schema::{BTreeTable, Column, Index},
     Result,
 };
+use crate::{
+    schema::{PseudoTable, Type},
+    translate::plan::Plan::{Delete, Select},
+};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ResultSetColumn {
     pub expr: ast::Expr,
+    pub name: String,
     // TODO: encode which aggregates (e.g. index bitmask of plan.aggregates) are present in this column
     pub contains_aggregates: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GroupBy {
     pub exprs: Vec<ast::Expr>,
     /// having clause split into a vec at 'AND' boundaries.
     pub having: Option<Vec<ast::Expr>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Plan {
     Select(SelectPlan),
     Delete(DeletePlan),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+pub enum SelectQueryType {
+    TopLevel,
+    Subquery { yield_reg: usize },
+}
+
+#[derive(Debug, Clone)]
 pub struct SelectPlan {
     /// A tree of sources (tables).
     pub source: SourceOperator,
@@ -49,15 +59,17 @@ pub struct SelectPlan {
     /// limit clause
     pub limit: Option<usize>,
     /// all the tables referenced in the query
-    pub referenced_tables: Vec<BTreeTableReference>,
+    pub referenced_tables: Vec<SourceReference>,
     /// all the indexes available
     pub available_indexes: Vec<Rc<Index>>,
     /// query contains a constant condition that is always false
     pub contains_constant_false_condition: bool,
+    /// query type (top level or subquery)
+    pub query_type: SelectQueryType,
 }
 
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DeletePlan {
     /// A tree of sources (tables).
     pub source: SourceOperator,
@@ -70,7 +82,7 @@ pub struct DeletePlan {
     /// limit clause
     pub limit: Option<usize>,
     /// all the tables referenced in the query
-    pub referenced_tables: Vec<BTreeTableReference>,
+    pub referenced_tables: Vec<SourceReference>,
     /// all the indexes available
     pub available_indexes: Vec<Rc<Index>>,
     /// query contains a constant condition that is always false
@@ -94,11 +106,12 @@ pub enum IterationDirection {
 
 impl SourceOperator {
     pub fn select_star(&self, out_columns: &mut Vec<ResultSetColumn>) {
-        for (table_ref, col, idx) in self.select_star_helper() {
+        for (table_index, col, idx) in self.select_star_helper() {
             out_columns.push(ResultSetColumn {
+                name: col.name.clone(),
                 expr: ast::Expr::Column {
                     database: None,
-                    table: table_ref.table_index,
+                    table: table_index,
                     column: idx,
                     is_rowid_alias: col.is_rowid_alias,
                 },
@@ -108,7 +121,7 @@ impl SourceOperator {
     }
 
     /// All this ceremony is required to deduplicate columns when joining with USING
-    fn select_star_helper(&self) -> Vec<(&BTreeTableReference, &Column, usize)> {
+    fn select_star_helper(&self) -> Vec<(usize, &Column, usize)> {
         match self {
             SourceOperator::Join {
                 left, right, using, ..
@@ -120,12 +133,12 @@ impl SourceOperator {
                 if let Some(using_cols) = using {
                     let right_columns = right.select_star_helper();
 
-                    for (table_ref, col, idx) in right_columns {
+                    for (table_index, col, idx) in right_columns {
                         if !using_cols
                             .iter()
                             .any(|using_col| col.name.eq_ignore_ascii_case(&using_col.0))
                         {
-                            columns.push((table_ref, col, idx));
+                            columns.push((table_index, col, idx));
                         }
                     }
                 } else {
@@ -143,7 +156,16 @@ impl SourceOperator {
                 .columns
                 .iter()
                 .enumerate()
-                .map(|(i, col)| (table_reference, col, i))
+                .map(|(i, col)| (table_reference.table_index, col, i))
+                .collect(),
+            SourceOperator::Subquery {
+                table_reference, ..
+            } => table_reference
+                .table
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, col)| (table_reference.table_index, col, i))
                 .collect(),
             SourceOperator::Nothing => Vec::new(),
         }
@@ -191,6 +213,12 @@ pub enum SourceOperator {
         search: Search,
         predicates: Option<Vec<ast::Expr>>,
     },
+    Subquery {
+        id: usize,
+        table_reference: PseudoTableReference,
+        plan: Box<SelectPlan>,
+        predicates: Option<Vec<ast::Expr>>,
+    },
     // Nothing operator
     // This operator is used to represent an empty query.
     // e.g. SELECT * from foo WHERE 0 will eventually be optimized to Nothing.
@@ -198,10 +226,92 @@ pub enum SourceOperator {
 }
 
 #[derive(Clone, Debug)]
+pub enum SourceReference {
+    BTreeTable {
+        table_reference: BTreeTableReference,
+    },
+    Subquery {
+        table_reference: PseudoTableReference,
+        result_columns_start_reg: usize,
+    },
+}
+
+#[derive(Clone, Debug)]
 pub struct BTreeTableReference {
     pub table: Rc<BTreeTable>,
     pub table_identifier: String,
     pub table_index: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct PseudoTableReference {
+    pub table: Rc<PseudoTable>,
+    pub table_identifier: String,
+    pub table_index: usize,
+}
+
+impl SourceReference {
+    pub fn new_subquery(identifier: String, table_index: usize, plan: &SelectPlan) -> Self {
+        Self::Subquery {
+            table_reference: PseudoTableReference {
+                table: Rc::new(PseudoTable::new_with_columns(
+                    plan.result_columns
+                        .iter()
+                        .map(|rc| Column {
+                            name: rc.name.clone(),
+                            ty: Type::Text, // FIXME: infer proper type
+                            is_rowid_alias: false,
+                            primary_key: false,
+                        })
+                        .collect(),
+                )),
+                table_identifier: identifier.clone(),
+                table_index,
+            },
+            result_columns_start_reg: usize::MAX, // Will be set later in bytecode emission
+        }
+    }
+    pub fn identifier(&self) -> &str {
+        match self {
+            SourceReference::BTreeTable {
+                table_reference:
+                    BTreeTableReference {
+                        table_identifier, ..
+                    },
+            } => table_identifier,
+            SourceReference::Subquery {
+                table_reference:
+                    PseudoTableReference {
+                        table_identifier, ..
+                    },
+                ..
+            } => table_identifier,
+        }
+    }
+
+    pub fn columns(&self) -> &[Column] {
+        match self {
+            SourceReference::BTreeTable {
+                table_reference: BTreeTableReference { table, .. },
+            } => &table.columns,
+            SourceReference::Subquery {
+                table_reference: PseudoTableReference { table, .. },
+                ..
+            } => &table.columns,
+        }
+    }
+
+    pub fn table_index(&self) -> usize {
+        match self {
+            SourceReference::BTreeTable {
+                table_reference: BTreeTableReference { table_index, .. },
+            } => *table_index,
+            SourceReference::Subquery {
+                table_reference: PseudoTableReference { table_index, .. },
+                ..
+            } => *table_index,
+        }
+    }
 }
 
 /// An enum that represents a search operation that can be used to search for a row in a table using an index
@@ -230,6 +340,7 @@ impl SourceOperator {
             SourceOperator::Join { id, .. } => *id,
             SourceOperator::Scan { id, .. } => *id,
             SourceOperator::Search { id, .. } => *id,
+            SourceOperator::Subquery { id, .. } => *id,
             SourceOperator::Nothing => unreachable!(),
         }
     }
@@ -365,6 +476,9 @@ impl Display for SourceOperator {
                     }
                     Ok(())
                 }
+                SourceOperator::Subquery { plan, .. } => {
+                    fmt_operator(&plan.source, f, level + 1, last)
+                }
                 SourceOperator::Nothing => Ok(()),
             }
         }
@@ -382,7 +496,7 @@ impl Display for SourceOperator {
     then the return value will be (in bits): 110
 */
 pub fn get_table_ref_bitmask_for_operator<'a>(
-    tables: &'a Vec<BTreeTableReference>,
+    tables: &'a Vec<SourceReference>,
     operator: &'a SourceOperator,
 ) -> Result<usize> {
     let mut table_refs_mask = 0;
@@ -397,7 +511,7 @@ pub fn get_table_ref_bitmask_for_operator<'a>(
             table_refs_mask |= 1
                 << tables
                     .iter()
-                    .position(|t| t.table_identifier == table_reference.table_identifier)
+                    .position(|t| t.identifier() == table_reference.table_identifier)
                     .unwrap();
         }
         SourceOperator::Search {
@@ -406,9 +520,10 @@ pub fn get_table_ref_bitmask_for_operator<'a>(
             table_refs_mask |= 1
                 << tables
                     .iter()
-                    .position(|t| t.table_identifier == table_reference.table_identifier)
+                    .position(|t| t.identifier() == table_reference.table_identifier)
                     .unwrap();
         }
+        SourceOperator::Subquery { .. } => {}
         SourceOperator::Nothing => {}
     }
     Ok(table_refs_mask)
@@ -424,7 +539,7 @@ pub fn get_table_ref_bitmask_for_operator<'a>(
 */
 #[allow(clippy::only_used_in_recursion)]
 pub fn get_table_ref_bitmask_for_ast_expr<'a>(
-    tables: &'a Vec<BTreeTableReference>,
+    tables: &'a Vec<SourceReference>,
     predicate: &'a ast::Expr,
 ) -> Result<usize> {
     let mut table_refs_mask = 0;
