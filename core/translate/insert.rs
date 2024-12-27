@@ -12,6 +12,7 @@ use crate::{
     storage::sqlite3_ondisk::DatabaseHeader,
     translate::expr::translate_expr,
     vdbe::{builder::ProgramBuilder, Insn, Program},
+    SymbolTable,
 };
 use crate::{Connection, Result};
 
@@ -121,6 +122,7 @@ fn populate_column_registers(
     column_registers_start: usize,
     inserting_multiple_rows: bool,
     rowid_reg: usize,
+    syms: &SymbolTable,
 ) -> Result<()> {
     for (i, mapping) in column_mappings.iter().enumerate() {
         let target_reg = column_registers_start + i;
@@ -143,6 +145,7 @@ fn populate_column_registers(
                 value.get(value_index).expect("value index out of bounds"),
                 reg,
                 None,
+                syms,
             )?;
             if write_directly_to_rowid_reg {
                 program.emit_insn(Insn::SoftNull { reg: target_reg });
@@ -176,6 +179,7 @@ pub fn translate_insert(
     _returning: &Option<Vec<ResultColumn>>,
     database_header: Rc<RefCell<DatabaseHeader>>,
     connection: Weak<Connection>,
+    syms: &SymbolTable,
 ) -> Result<Program> {
     if with.is_some() {
         crate::bail_parse_error!("WITH clause is not supported");
@@ -274,6 +278,7 @@ pub fn translate_insert(
                 column_registers_start,
                 true,
                 rowid_reg,
+                syms,
             )?;
             program.emit_insn(Insn::Yield {
                 yield_reg,
@@ -315,6 +320,7 @@ pub fn translate_insert(
             column_registers_start,
             false,
             rowid_reg,
+            syms,
         )?;
     }
 

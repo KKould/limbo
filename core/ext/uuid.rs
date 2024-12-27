@@ -1,7 +1,7 @@
 use super::ExtFunc;
 use crate::{
     types::{LimboText, OwnedValue},
-    LimboError,
+    Database, LimboError,
 };
 use std::rc::Rc;
 use uuid::{ContextV7, Timestamp, Uuid};
