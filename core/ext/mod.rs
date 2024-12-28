@@ -28,3 +28,8 @@ impl ExtFunc {
         }
     }
 }
+
+pub fn init(db: &mut crate::Database) {
+    #[cfg(feature = "uuid")]
+    uuid::init(db);
+}

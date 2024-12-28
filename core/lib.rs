@@ -123,14 +123,16 @@ impl Database {
         let header = db_header;
         let schema = Rc::new(RefCell::new(Schema::new()));
         let syms = Rc::new(RefCell::new(SymbolTable::new()));
-        let db = Arc::new(Database {
+        let mut db = Database {
             pager: pager.clone(),
             schema: schema.clone(),
             header: header.clone(),
             shared_page_cache,
             shared_wal,
             syms,
-        });
+        };
+        ext::init(&mut db);
+        let db = Arc::new(db);
         let conn = Rc::new(Connection {
             pager: pager,
             schema: schema.clone(),
