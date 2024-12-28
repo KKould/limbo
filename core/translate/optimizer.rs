@@ -5,9 +5,9 @@ use sqlite3_parser::ast;
 use crate::{schema::Index, Result};
 
 use super::plan::{
-    get_table_ref_bitmask_for_ast_expr, get_table_ref_bitmask_for_operator, BTreeTableReference,
-    DeletePlan, Direction, IterationDirection, Plan, PseudoTableReference, Search, SelectPlan,
-    SourceOperator, SourceReference,
+    get_table_ref_bitmask_for_ast_expr, get_table_ref_bitmask_for_operator, DeletePlan, Direction,
+    IterationDirection, Plan, Search, SelectPlan, SourceOperator, TableReference,
+    TableReferenceType,
 };
 
 pub fn optimize_plan(plan: &mut Plan) -> Result<()> {
@@ -90,7 +90,7 @@ fn optimize_subqueries(operator: &mut SourceOperator) -> Result<()> {
 fn _operator_is_already_ordered_by(
     operator: &mut SourceOperator,
     key: &mut ast::Expr,
-    referenced_tables: &[SourceReference],
+    referenced_tables: &[TableReference],
     available_indexes: &Vec<Rc<Index>>,
 ) -> Result<bool> {
     match operator {
@@ -126,7 +126,7 @@ fn _operator_is_already_ordered_by(
 fn eliminate_unnecessary_orderby(
     operator: &mut SourceOperator,
     order_by: &mut Option<Vec<(ast::Expr, Direction)>>,
-    referenced_tables: &[SourceReference],
+    referenced_tables: &[TableReference],
     available_indexes: &Vec<Rc<Index>>,
 ) -> Result<()> {
     if order_by.is_none() {
@@ -158,7 +158,7 @@ fn eliminate_unnecessary_orderby(
  */
 fn use_indexes(
     operator: &mut SourceOperator,
-    referenced_tables: &[SourceReference],
+    referenced_tables: &[TableReference],
     available_indexes: &[Rc<Index>],
 ) -> Result<()> {
     match operator {
@@ -179,7 +179,7 @@ fn use_indexes(
                 let f = fs[i].take_ownership();
                 let table_index = referenced_tables
                     .iter()
-                    .position(|t| t.identifier() == table_reference.table_identifier)
+                    .position(|t| t.table_identifier == table_reference.table_identifier)
                     .unwrap();
                 match try_extract_index_search_expression(
                     f,
@@ -350,7 +350,7 @@ fn eliminate_constants(
 fn push_predicates(
     operator: &mut SourceOperator,
     where_clause: &mut Option<Vec<ast::Expr>>,
-    referenced_tables: &Vec<SourceReference>,
+    referenced_tables: &Vec<TableReference>,
 ) -> Result<()> {
     // First try to push down any predicates from the WHERE clause
     if let Some(predicates) = where_clause {
@@ -441,7 +441,7 @@ fn push_predicates(
 fn push_predicate(
     operator: &mut SourceOperator,
     predicate: ast::Expr,
-    referenced_tables: &Vec<SourceReference>,
+    referenced_tables: &Vec<TableReference>,
 ) -> Result<Option<ast::Expr>> {
     match operator {
         SourceOperator::Subquery {
@@ -469,15 +469,9 @@ fn push_predicate(
             // Find position of this subquery in referenced_tables array
             let subquery_index = referenced_tables
                 .iter()
-                .position(|t| match t {
-                    SourceReference::Subquery {
-                        table_reference:
-                            PseudoTableReference {
-                                table_identifier, ..
-                            },
-                        ..
-                    } => *table_identifier == table_reference.table_identifier,
-                    _ => false,
+                .position(|t| {
+                    t.table_identifier == table_reference.table_identifier
+                        && matches!(t.reference_type, TableReferenceType::Subquery { .. })
                 })
                 .unwrap();
 
@@ -513,15 +507,9 @@ fn push_predicate(
             // Find position of this table in referenced_tables array
             let table_index = referenced_tables
                 .iter()
-                .position(|t| match t {
-                    SourceReference::BTreeTable {
-                        table_reference:
-                            BTreeTableReference {
-                                table_identifier, ..
-                            },
-                        ..
-                    } => *table_identifier == table_reference.table_identifier,
-                    SourceReference::Subquery { .. } => false,
+                .position(|t| {
+                    t.table_identifier == table_reference.table_identifier
+                        && t.reference_type == TableReferenceType::BTreeTable
                 })
                 .unwrap();
 
@@ -682,7 +670,7 @@ pub trait Optimizable {
     fn check_index_scan(
         &mut self,
         table_index: usize,
-        referenced_tables: &[SourceReference],
+        referenced_tables: &[TableReference],
         available_indexes: &[Rc<Index>],
     ) -> Result<Option<usize>>;
 }
@@ -701,7 +689,7 @@ impl Optimizable for ast::Expr {
     fn check_index_scan(
         &mut self,
         table_index: usize,
-        referenced_tables: &[SourceReference],
+        referenced_tables: &[TableReference],
         available_indexes: &[Rc<Index>],
     ) -> Result<Option<usize>> {
         match self {
@@ -710,15 +698,9 @@ impl Optimizable for ast::Expr {
                     return Ok(None);
                 }
                 for (idx, index) in available_indexes.iter().enumerate() {
-                    let SourceReference::BTreeTable {
-                        table_reference: BTreeTableReference { table, .. },
-                        ..
-                    } = &referenced_tables[*table]
-                    else {
-                        continue;
-                    };
-                    if index.table_name == table.name {
-                        let column = table.columns.get(*column).unwrap();
+                    let table_ref = &referenced_tables[*table];
+                    if index.table_name == table_ref.table.get_name() {
+                        let column = table_ref.table.get_column_at(*column);
                         if index.columns.first().unwrap().name == column.name {
                             return Ok(Some(idx));
                         }
@@ -883,7 +865,7 @@ pub enum Either<T, U> {
 pub fn try_extract_index_search_expression(
     expr: ast::Expr,
     table_index: usize,
-    referenced_tables: &[SourceReference],
+    referenced_tables: &[TableReference],
     available_indexes: &[Rc<Index>],
 ) -> Result<Either<ast::Expr, Search>> {
     match expr {

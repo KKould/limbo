@@ -71,6 +71,14 @@ impl Table {
         }
     }
 
+    pub fn get_root_page(&self) -> usize {
+        match self {
+            Table::BTree(table) => table.root_page,
+            Table::Index(_) => unimplemented!(),
+            Table::Pseudo(_) => unimplemented!(),
+        }
+    }
+
     pub fn get_name(&self) -> &str {
         match self {
             Self::BTree(table) => &table.name,

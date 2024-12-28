@@ -1,13 +1,13 @@
 use super::{
     expr::get_name,
     plan::{
-        Aggregate, BTreeTableReference, DeletePlan, Direction, GroupBy, Plan, ResultSetColumn,
-        SelectPlan, SelectQueryType, SourceOperator, SourceReference,
+        Aggregate, DeletePlan, Direction, GroupBy, Plan, ResultSetColumn, SelectPlan,
+        SelectQueryType, SourceOperator, TableReference, TableReferenceType,
     },
 };
 use crate::{
     function::Func,
-    schema::Schema,
+    schema::{Schema, Table},
     util::{exprs_are_equivalent, normalize_ident},
     Result,
 };
@@ -96,7 +96,7 @@ fn resolve_aggregates(expr: &ast::Expr, aggs: &mut Vec<Aggregate>) -> bool {
 /// Id, Qualified and DoublyQualified are converted to Column.
 fn bind_column_references(
     expr: &mut ast::Expr,
-    referenced_tables: &[SourceReference],
+    referenced_tables: &[TableReference],
 ) -> Result<()> {
     match expr {
         ast::Expr::Id(id) => {
@@ -134,9 +134,10 @@ fn bind_column_references(
         }
         ast::Expr::Qualified(tbl, id) => {
             let normalized_table_name = normalize_ident(tbl.0.as_str());
-            let matching_tbl_idx = referenced_tables
-                .iter()
-                .position(|t| t.identifier().eq_ignore_ascii_case(&normalized_table_name));
+            let matching_tbl_idx = referenced_tables.iter().position(|t| {
+                t.table_identifier
+                    .eq_ignore_ascii_case(&normalized_table_name)
+            });
             if matching_tbl_idx.is_none() {
                 crate::bail_parse_error!("Table {} not found", normalized_table_name);
             }
@@ -305,7 +306,7 @@ pub fn prepare_select_plan<'a>(schema: &Schema, select: ast::Select) -> Result<P
                         let referenced_table = plan
                             .referenced_tables
                             .iter()
-                            .find(|t| t.identifier() == name_normalized);
+                            .find(|t| t.table_identifier == name_normalized);
 
                         if referenced_table.is_none() {
                             crate::bail_parse_error!("Table {} not found", name.0);
@@ -315,7 +316,7 @@ pub fn prepare_select_plan<'a>(schema: &Schema, select: ast::Select) -> Result<P
                             plan.result_columns.push(ResultSetColumn {
                                 expr: ast::Expr::Column {
                                     database: None, // TODO: support different databases
-                                    table: table_reference.table_index(),
+                                    table: table_reference.table_index,
                                     column: idx,
                                     is_rowid_alias: col.is_rowid_alias,
                                 },
@@ -521,15 +522,13 @@ pub fn prepare_delete_plan(
         None => crate::bail_corrupt_error!("Parse error: no such table: {}", tbl_name),
     };
 
-    let btree_table_ref = BTreeTableReference {
-        table: table.clone(),
+    let btree_table_ref = TableReference {
+        table: Table::BTree(table.clone()),
         table_identifier: table.name.clone(),
         table_index: 0,
+        reference_type: TableReferenceType::BTreeTable,
     };
-    let source_ref = SourceReference::BTreeTable {
-        table_reference: btree_table_ref.clone(),
-    };
-    let referenced_tables = vec![source_ref.clone()];
+    let referenced_tables = vec![btree_table_ref.clone()];
 
     // Parse the WHERE clause
     let resolved_where_clauses = parse_where(where_clause, &referenced_tables)?;
@@ -561,7 +560,7 @@ fn parse_from(
     schema: &Schema,
     from: Option<FromClause>,
     operator_id_counter: &mut OperatorIdCounter,
-) -> Result<(SourceOperator, Vec<SourceReference>)> {
+) -> Result<(SourceOperator, Vec<TableReference>)> {
     if from.as_ref().and_then(|f| f.select.as_ref()).is_none() {
         return Ok((SourceOperator::Nothing, vec![]));
     }
@@ -585,17 +584,15 @@ fn parse_from(
                 })
                 .map(|a| a.0);
 
-            let btree_table_reference = BTreeTableReference {
-                table: table.clone(),
+            let btree_table_reference = TableReference {
+                table: Table::BTree(table.clone()),
                 table_identifier: alias.unwrap_or(normalized_qualified_name),
                 table_index: 0,
+                reference_type: TableReferenceType::BTreeTable,
             };
-            let table_reference = SourceReference::BTreeTable {
-                table_reference: btree_table_reference.clone(),
-            };
-            tables.push(table_reference.clone());
+            tables.push(btree_table_reference.clone());
             (
-                table_reference.clone(),
+                btree_table_reference.clone(),
                 SourceOperator::Scan {
                     table_reference: btree_table_reference.clone(),
                     predicates: None,
@@ -619,19 +616,13 @@ fn parse_from(
                 .unwrap_or(format!("subquery_{}", table_index));
 
             let source_reference =
-                SourceReference::new_subquery(identifier.clone(), table_index, &subplan);
+                TableReference::new_subquery(identifier.clone(), table_index, &subplan);
             tables.push(source_reference.clone());
-            let SourceReference::Subquery {
-                table_reference, ..
-            } = source_reference.clone()
-            else {
-                unreachable!();
-            };
             (
-                source_reference,
+                source_reference.clone(),
                 SourceOperator::Subquery {
                     id: operator_id_counter.get_next_id(),
-                    table_reference: table_reference.clone(),
+                    table_reference: source_reference,
                     plan: Box::new(subplan),
                     predicates: None,
                 },
@@ -662,7 +653,7 @@ fn parse_from(
 
 fn parse_where(
     where_clause: Option<Expr>,
-    referenced_tables: &[SourceReference],
+    referenced_tables: &[TableReference],
 ) -> Result<Option<Vec<Expr>>> {
     if let Some(where_expr) = where_clause {
         let mut predicates = vec![];
@@ -680,7 +671,7 @@ fn parse_join(
     schema: &Schema,
     join: ast::JoinedSelectTable,
     operator_id_counter: &mut OperatorIdCounter,
-    tables: &mut Vec<SourceReference>,
+    tables: &mut Vec<TableReference>,
     table_index: usize,
 ) -> Result<(
     SourceOperator,
@@ -706,14 +697,13 @@ fn parse_join(
                     ast::As::Elided(id) => id,
                 })
                 .map(|a| a.0);
-            let table_ref = BTreeTableReference {
-                table: table.clone(),
+            let table_ref = TableReference {
+                table: Table::BTree(table.clone()),
                 table_identifier: alias.unwrap_or(normalized_name),
                 table_index,
+                reference_type: TableReferenceType::BTreeTable,
             };
-            tables.push(SourceReference::BTreeTable {
-                table_reference: table_ref.clone(),
-            });
+            tables.push(table_ref.clone());
 
             SourceOperator::Scan {
                 table_reference: table_ref,
@@ -737,18 +727,12 @@ fn parse_join(
                 .unwrap_or(format!("subquery_{}", table_index));
 
             let source_reference =
-                SourceReference::new_subquery(identifier.clone(), table_index, &subplan);
+                TableReference::new_subquery(identifier.clone(), table_index, &subplan);
             tables.push(source_reference.clone());
-            let SourceReference::Subquery {
-                table_reference, ..
-            } = source_reference
-            else {
-                unreachable!();
-            };
 
             SourceOperator::Subquery {
                 id: operator_id_counter.get_next_id(),
-                table_reference: table_reference.clone(),
+                table_reference: source_reference,
                 plan: Box::new(subplan),
                 predicates: None,
             }
@@ -871,7 +855,7 @@ fn parse_join(
                         ast::Operator::Equals,
                         Box::new(ast::Expr::Column {
                             database: None,
-                            table: right_table.table_index(),
+                            table: right_table.table_index,
                             column: right_col_idx,
                             is_rowid_alias: right_col.is_rowid_alias,
                         }),

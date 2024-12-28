@@ -20,7 +20,9 @@ use super::expr::{
     translate_aggregation, translate_aggregation_groupby, translate_condition_expr, translate_expr,
     ConditionMetadata,
 };
-use super::plan::{Aggregate, Direction, GroupBy, SelectPlan, SelectQueryType, SourceReference};
+use super::plan::{
+    Aggregate, Direction, GroupBy, SelectPlan, SelectQueryType, TableReference, TableReferenceType,
+};
 use super::plan::{ResultSetColumn, SourceOperator};
 
 // Metadata for handling LEFT JOIN operations
@@ -212,7 +214,7 @@ fn emit_program_for_select(
 
 fn emit_subqueries(
     program: &mut ProgramBuilder,
-    referenced_tables: &mut [SourceReference],
+    referenced_tables: &mut [TableReference],
     metadata: &mut Metadata,
     source: &mut SourceOperator,
 ) -> Result<()> {
@@ -223,18 +225,17 @@ fn emit_subqueries(
             ..
         } => {
             let result_columns_start = emit_subquery(program, plan)?;
-            let reference = referenced_tables
+            let reg = referenced_tables
                 .iter_mut()
-                .find(|t| t.identifier() == table_reference.table_identifier)
+                .find(|t| t.table_identifier == table_reference.table_identifier)
                 .unwrap();
-            match reference {
-                SourceReference::Subquery {
-                    result_columns_start_reg,
-                    ..
-                } => {
-                    *result_columns_start_reg = result_columns_start;
-                }
-                _ => unreachable!(),
+            if let TableReferenceType::Subquery {
+                result_columns_start_reg,
+            } = &mut reg.reference_type
+            {
+                *result_columns_start_reg = result_columns_start;
+            } else {
+                unreachable!("emit_subqueries called on non-subquery");
             }
             Ok(())
         }
@@ -598,9 +599,9 @@ fn init_source(
         } => {
             let cursor_id = program.alloc_cursor_id(
                 Some(table_reference.table_identifier.clone()),
-                Some(Table::BTree(table_reference.table.clone())),
+                Some(table_reference.table.clone()),
             );
-            let root_page = table_reference.table.root_page;
+            let root_page = table_reference.table.get_root_page();
             let next_row_label = program.allocate_label();
             metadata.next_row_labels.insert(*id, next_row_label);
 
@@ -634,7 +635,7 @@ fn init_source(
         } => {
             let table_cursor_id = program.alloc_cursor_id(
                 Some(table_reference.table_identifier.clone()),
-                Some(Table::BTree(table_reference.table.clone())),
+                Some(table_reference.table.clone()),
             );
 
             let next_row_label = program.allocate_label();
@@ -645,14 +646,14 @@ fn init_source(
                 OperationMode::SELECT => {
                     program.emit_insn(Insn::OpenReadAsync {
                         cursor_id: table_cursor_id,
-                        root_page: table_reference.table.root_page,
+                        root_page: table_reference.table.get_root_page(),
                     });
                     program.emit_insn(Insn::OpenReadAwait {});
                 }
                 OperationMode::DELETE => {
                     program.emit_insn(Insn::OpenWriteAsync {
                         cursor_id: table_cursor_id,
-                        root_page: table_reference.table.root_page,
+                        root_page: table_reference.table.get_root_page(),
                     });
                     program.emit_insn(Insn::OpenWriteAwait {});
                 }
@@ -698,7 +699,7 @@ fn init_source(
 fn open_loop(
     program: &mut ProgramBuilder,
     source: &mut SourceOperator,
-    referenced_tables: &[SourceReference],
+    referenced_tables: &[TableReference],
     metadata: &mut Metadata,
 ) -> Result<()> {
     match source {
@@ -1148,7 +1149,7 @@ fn inner_loop_source_emit(
     aggregates: &[Aggregate],
     metadata: &mut Metadata,
     emit_target: InnerLoopEmitTarget,
-    referenced_tables: &[SourceReference],
+    referenced_tables: &[TableReference],
 ) -> Result<()> {
     match emit_target {
         InnerLoopEmitTarget::GroupBySorter {
@@ -1262,7 +1263,7 @@ fn close_loop(
     program: &mut ProgramBuilder,
     source: &SourceOperator,
     metadata: &mut Metadata,
-    referenced_tables: &[SourceReference],
+    referenced_tables: &[TableReference],
 ) -> Result<()> {
     match source {
         SourceOperator::Subquery { id, .. } => {
@@ -1480,7 +1481,7 @@ fn group_by_emit(
     order_by: Option<&Vec<(ast::Expr, Direction)>>,
     aggregates: &[Aggregate],
     limit: Option<usize>,
-    referenced_tables: &[SourceReference],
+    referenced_tables: &[TableReference],
     metadata: &mut Metadata,
     query_type: &SelectQueryType,
 ) -> Result<()> {
@@ -1850,7 +1851,7 @@ fn group_by_emit(
 /// and we can now materialize the aggregate results.
 fn agg_without_group_by_emit(
     program: &mut ProgramBuilder,
-    referenced_tables: &[SourceReference],
+    referenced_tables: &[TableReference],
     result_columns: &[ResultSetColumn],
     aggregates: &[Aggregate],
     metadata: &mut Metadata,
@@ -2051,7 +2052,7 @@ fn emit_result_row_and_limit(
 /// Emits the bytecode for: all result columns, result row, and limit.
 fn emit_select_result(
     program: &mut ProgramBuilder,
-    referenced_tables: &[SourceReference],
+    referenced_tables: &[TableReference],
     result_columns: &[ResultSetColumn],
     result_column_start_register: usize,
     precomputed_exprs_to_register: Option<&Vec<(&ast::Expr, usize)>>,
@@ -2096,7 +2097,7 @@ fn sorter_insert(
 /// Emits the bytecode for inserting a row into an ORDER BY sorter.
 fn order_by_sorter_insert(
     program: &mut ProgramBuilder,
-    referenced_tables: &[SourceReference],
+    referenced_tables: &[TableReference],
     order_by: &[(ast::Expr, Direction)],
     result_columns: &[ResultSetColumn],
     result_column_indexes_in_orderby_sorter: &mut HashMap<usize, usize>,
