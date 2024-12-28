@@ -23,7 +23,6 @@ use schema::Schema;
 use sqlite3_parser::ast;
 use sqlite3_parser::{ast::Cmd, lexer::sql::Parser};
 use std::cell::Cell;
-use std::sync::Weak;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::{cell::RefCell, rc::Rc};
 use storage::btree::btree_init_page;
@@ -118,27 +117,27 @@ impl Database {
             shared_page_cache.clone(),
             buffer_pool,
         )?);
-        let bootstrap_schema = Rc::new(RefCell::new(Schema::new()));
-        let conn = Rc::new(Connection {
-            pager: pager.clone(),
-            schema: bootstrap_schema.clone(),
-            header: db_header.clone(),
-            transaction_state: RefCell::new(TransactionState::None),
-            db: Weak::new(),
-            last_insert_rowid: Cell::new(0),
-        });
-        let mut schema = Schema::new();
-        let rows = conn.query("SELECT * FROM sqlite_schema")?;
-        parse_schema_rows(rows, &mut schema, io)?;
-        let schema = Rc::new(RefCell::new(schema));
         let header = db_header;
-        Ok(Arc::new(Database {
-            pager,
-            schema,
-            header,
+        let schema = Rc::new(RefCell::new(Schema::new()));
+        let db = Arc::new(Database {
+            pager: pager.clone(),
+            schema: schema.clone(),
+            header: header.clone(),
             shared_page_cache,
             shared_wal,
-        }))
+        });
+        let conn = Rc::new(Connection {
+            pager: pager,
+            schema: schema.clone(),
+            header,
+            transaction_state: RefCell::new(TransactionState::None),
+            db: db.clone(),
+            last_insert_rowid: Cell::new(0),
+        });
+        let rows = conn.query("SELECT * FROM sqlite_schema")?;
+        let mut schema = schema.borrow_mut();
+        parse_schema_rows(rows, &mut schema, io)?;
+        Ok(db)
     }
 
     pub fn connect(self: &Arc<Database>) -> Rc<Connection> {
@@ -147,7 +146,7 @@ impl Database {
             schema: self.schema.clone(),
             header: self.header.clone(),
             last_insert_rowid: Cell::new(0),
-            db: Arc::downgrade(self),
+            db: self.clone(),
             transaction_state: RefCell::new(TransactionState::None),
         })
     }
@@ -203,10 +202,10 @@ pub fn maybe_init_database_file(file: &Rc<dyn File>, io: &Arc<dyn IO>) -> Result
 }
 
 pub struct Connection {
+    db: Arc<Database>,
     pager: Rc<Pager>,
     schema: Rc<RefCell<Schema>>,
     header: Rc<RefCell<DatabaseHeader>>,
-    db: Weak<Database>, // backpointer to the database holding this connection
     transaction_state: RefCell<TransactionState>,
     last_insert_rowid: Cell<u64>,
 }
