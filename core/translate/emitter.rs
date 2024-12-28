@@ -325,8 +325,6 @@ fn emit_query(
         init_order_by(program, order_by, metadata)?;
     }
 
-    if !plan.aggregates.is_empty() {}
-
     if let Some(ref mut group_by) = plan.group_by {
         let output_groupby_row_label = program.allocate_label();
         metadata
