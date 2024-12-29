@@ -107,6 +107,8 @@ pub struct Metadata {
     // We might skip adding a SELECT result column into the ORDER BY sorter if it is an exact match in the ORDER BY keys.
     // This vector holds the indexes of the result columns that we need to skip.
     pub result_columns_to_skip_in_orderby_sorter: Option<Vec<usize>>,
+    // The register holding the limit value, if any.
+    pub limit_reg: Option<usize>,
 }
 
 /// Used to distinguish database operations
@@ -146,6 +148,7 @@ fn prologue() -> Result<(ProgramBuilder, Metadata, BranchOffset, BranchOffset)> 
         result_column_start_register: None,
         result_column_indexes_in_orderby_sorter: HashMap::new(),
         result_columns_to_skip_in_orderby_sorter: None,
+        limit_reg: None,
     };
 
     Ok((program, metadata, init_label, start_offset))
@@ -302,6 +305,7 @@ fn emit_subquery(program: &mut ProgramBuilder, plan: &mut SelectPlan) -> Result<
         result_column_start_register: None,
         result_column_indexes_in_orderby_sorter: HashMap::new(),
         result_columns_to_skip_in_orderby_sorter: None,
+        limit_reg: plan.limit.map(|l| program.alloc_register()),
     };
     let subquery_body_end_label = program.allocate_label();
     program.emit_insn_with_label_dependency(
@@ -312,6 +316,15 @@ fn emit_subquery(program: &mut ProgramBuilder, plan: &mut SelectPlan) -> Result<
         },
         subquery_body_end_label,
     );
+    // Normally we mark each LIMIT value as a constant insn that is emitted only once, but in the case of a subquery,
+    // we need to initialize it every time the subquery is run; otherwise subsequent runs of the subquery will already
+    // have the LIMIT counter at 0, and will never return rows.
+    if let Some(limit) = plan.limit {
+        program.emit_insn(Insn::Integer {
+            value: limit as i64,
+            dest: metadata.limit_reg.unwrap(),
+        });
+    }
     let result_column_start_reg = emit_query(program, plan, &mut metadata)?;
     program.resolve_label(end_coroutine_label, program.offset());
     program.emit_insn(Insn::EndCoroutine {
@@ -333,6 +346,10 @@ fn emit_query(
         metadata,
         &mut plan.source,
     )?;
+
+    if metadata.limit_reg.is_none() {
+        metadata.limit_reg = plan.limit.map(|_| program.alloc_register());
+    }
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     // however an aggregation might still happen,
@@ -1295,7 +1312,13 @@ fn inner_loop_source_emit(
                 result_columns,
                 metadata.result_column_start_register.unwrap(),
                 None,
-                limit.map(|l| (l, metadata.after_main_loop_label.unwrap())),
+                limit.map(|l| {
+                    (
+                        l,
+                        metadata.limit_reg.unwrap(),
+                        metadata.after_main_loop_label.unwrap(),
+                    )
+                }),
                 query_type,
             )?;
 
@@ -1846,7 +1869,13 @@ fn group_by_emit(
                 result_columns,
                 metadata.result_column_start_register.unwrap(),
                 Some(&precomputed_exprs_to_register),
-                limit.map(|l| (l, *metadata.termination_label_stack.last().unwrap())),
+                limit.map(|l| {
+                    (
+                        l,
+                        metadata.limit_reg.unwrap(),
+                        *metadata.termination_label_stack.last().unwrap(),
+                    )
+                }),
                 query_type,
             )?;
         }
@@ -2044,7 +2073,7 @@ fn order_by_emit(
         program,
         start_reg,
         result_columns.len(),
-        limit.map(|l| (l, sort_loop_end_label)),
+        limit.map(|l| (l, metadata.limit_reg.unwrap(), sort_loop_end_label)),
         &query_type,
     )?;
 
@@ -2068,7 +2097,7 @@ fn emit_result_row_and_limit(
     program: &mut ProgramBuilder,
     start_reg: usize,
     result_columns_len: usize,
-    limit: Option<(usize, BranchOffset)>,
+    limit: Option<(usize, usize, BranchOffset)>,
     query_type: &SelectQueryType,
 ) -> Result<()> {
     match query_type {
@@ -2086,8 +2115,7 @@ fn emit_result_row_and_limit(
         }
     }
 
-    if let Some((limit, jump_label_on_limit_reached)) = limit {
-        let limit_reg = program.alloc_register();
+    if let Some((limit, limit_reg, jump_label_on_limit_reached)) = limit {
         program.emit_insn(Insn::Integer {
             value: limit as i64,
             dest: limit_reg,
@@ -2114,7 +2142,7 @@ fn emit_select_result(
     result_columns: &[ResultSetColumn],
     result_column_start_register: usize,
     precomputed_exprs_to_register: Option<&Vec<(&ast::Expr, usize)>>,
-    limit: Option<(usize, BranchOffset)>,
+    limit: Option<(usize, usize, BranchOffset)>,
     query_type: &SelectQueryType,
 ) -> Result<()> {
     let start_reg = result_column_start_register;

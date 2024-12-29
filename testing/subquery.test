@@ -158,3 +158,27 @@ do_execsql_test subquery-join-using-with-outer-limit {
 } {"hat|hat-lol
 cap|cap-lol
 shirt|shirt-lol"}
+
+do_execsql_test subquery-join-using-with-inner-limit {
+    SELECT p.name, sub.funny_name 
+    FROM products p 
+    JOIN (
+        select id, concat(name, '-lol') as funny_name 
+        from products
+        limit 3
+    ) sub USING (id);
+} {"hat|hat-lol
+cap|cap-lol
+shirt|shirt-lol"}
+
+do_execsql_test subquery-join-using-with-both-limits {
+    SELECT p.name, sub.funny_name 
+    FROM products p 
+    JOIN (
+        select id, concat(name, '-lol') as funny_name 
+        from products
+        limit 3
+    ) sub USING (id)
+    LIMIT 2;
+} {"hat|hat-lol
+cap|cap-lol"}
