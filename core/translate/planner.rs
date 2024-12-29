@@ -419,7 +419,7 @@ pub fn prepare_select_plan<'a>(schema: &Schema, select: ast::Select) -> Result<P
                                 plan.result_columns.push(ResultSetColumn {
                                     name: get_name(
                                         maybe_alias.as_ref(),
-                                        &expr,
+                                        expr,
                                         &plan.referenced_tables,
                                         || format!("expr_{}", idx),
                                     ),
@@ -503,7 +503,7 @@ pub fn prepare_select_plan<'a>(schema: &Schema, select: ast::Select) -> Result<P
             }
 
             // Parse the LIMIT clause
-            plan.limit = select.limit.and_then(|limit| parse_limit(limit));
+            plan.limit = select.limit.and_then(parse_limit);
 
             // Return the unoptimized query plan
             Ok(Plan::Select(plan))
@@ -535,7 +535,7 @@ pub fn prepare_delete_plan(
     let resolved_where_clauses = parse_where(where_clause, &referenced_tables)?;
 
     // Parse the LIMIT clause
-    let resolved_limit = limit.and_then(|limit| parse_limit(limit));
+    let resolved_limit = limit.and_then(parse_limit);
 
     let plan = DeletePlan {
         source: SourceOperator::Scan {

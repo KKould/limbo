@@ -227,7 +227,6 @@ fn emit_program_for_select(
 fn emit_subqueries(
     program: &mut ProgramBuilder,
     referenced_tables: &mut [TableReference],
-    metadata: &mut Metadata,
     source: &mut SourceOperator,
 ) -> Result<()> {
     match source {
@@ -257,8 +256,8 @@ fn emit_subqueries(
             Ok(())
         }
         SourceOperator::Join { left, right, .. } => {
-            emit_subqueries(program, referenced_tables, metadata, left)?;
-            emit_subqueries(program, referenced_tables, metadata, right)?;
+            emit_subqueries(program, referenced_tables, left)?;
+            emit_subqueries(program, referenced_tables, right)?;
             Ok(())
         }
         _ => Ok(()),
@@ -342,12 +341,7 @@ fn emit_query(
     metadata: &mut Metadata,
 ) -> Result<usize> {
     // Emit subqueries first so the results can be read in the main query loop.
-    emit_subqueries(
-        program,
-        &mut plan.referenced_tables,
-        metadata,
-        &mut plan.source,
-    )?;
+    emit_subqueries(program, &mut plan.referenced_tables, &mut plan.source)?;
 
     if metadata.limit_reg.is_none() {
         metadata.limit_reg = plan.limit.map(|_| program.alloc_register());
@@ -401,7 +395,7 @@ fn emit_query(
     inner_loop_emit(program, plan, metadata)?;
 
     // Clean up and close the main execution loop
-    close_loop(program, &plan.source, metadata, &plan.referenced_tables)?;
+    close_loop(program, &plan.source, metadata)?;
 
     program.resolve_label(after_main_loop_label, program.offset());
 
@@ -488,12 +482,7 @@ fn emit_program_for_delete(
     emit_delete_insns(&mut program, &plan.source, &plan.limit, &metadata)?;
 
     // Clean up and close the main execution loop
-    close_loop(
-        &mut program,
-        &plan.source,
-        &mut metadata,
-        &plan.referenced_tables,
-    )?;
+    close_loop(&mut program, &plan.source, &mut metadata)?;
 
     program.resolve_label(after_main_loop_label, program.offset());
 
@@ -770,7 +759,7 @@ fn open_loop(
             program.emit_insn(Insn::InitCoroutine {
                 yield_reg,
                 jump_on_definition: 0,
-                start_offset: coroutine_implementation_start as i64,
+                start_offset: coroutine_implementation_start,
             });
             let loop_body_start_label = program.allocate_label();
             metadata.scan_loop_body_labels.push(loop_body_start_label);
@@ -818,7 +807,7 @@ fn open_loop(
                 }
             }
 
-            return Ok(());
+            Ok(())
         }
         SourceOperator::Join {
             id,
@@ -880,7 +869,7 @@ fn open_loop(
                 });
             }
 
-            return Ok(());
+            Ok(())
         }
         SourceOperator::Scan {
             id,
@@ -944,7 +933,7 @@ fn open_loop(
                 }
             }
 
-            return Ok(());
+            Ok(())
         }
         SourceOperator::Search {
             id,
@@ -1129,11 +1118,9 @@ fn open_loop(
                 }
             }
 
-            return Ok(());
+            Ok(())
         }
-        SourceOperator::Nothing => {
-            return Ok(());
-        }
+        SourceOperator::Nothing => Ok(()),
     }
 }
 
@@ -1203,7 +1190,7 @@ fn inner_loop_emit(
         );
     }
     // if we have neither, we emit a ResultRow. In that case, if we have a Limit, we handle that with DecrJumpZero.
-    return inner_loop_source_emit(
+    inner_loop_source_emit(
         program,
         &plan.result_columns,
         &plan.aggregates,
@@ -1213,7 +1200,7 @@ fn inner_loop_emit(
             limit: plan.limit,
         },
         &plan.referenced_tables,
-    );
+    )
 }
 
 /// This is a helper function for inner_loop_emit,
@@ -1345,7 +1332,6 @@ fn close_loop(
     program: &mut ProgramBuilder,
     source: &SourceOperator,
     metadata: &mut Metadata,
-    referenced_tables: &[TableReference],
 ) -> Result<()> {
     match source {
         SourceOperator::Subquery { id, .. } => {
@@ -1374,7 +1360,7 @@ fn close_loop(
             outer,
             ..
         } => {
-            close_loop(program, right, metadata, referenced_tables)?;
+            close_loop(program, right, metadata)?;
 
             if *outer {
                 let lj_meta = metadata.left_joins.get(id).unwrap();
@@ -1421,7 +1407,7 @@ fn close_loop(
                 assert!(program.offset() == jump_offset);
             }
 
-            close_loop(program, left, metadata, referenced_tables)?;
+            close_loop(program, left, metadata)?;
         }
         SourceOperator::Scan {
             id,
@@ -1965,7 +1951,7 @@ fn agg_without_group_by_emit(
         metadata.result_column_start_register.unwrap(),
         Some(&precomputed_exprs_to_register),
         None,
-        &query_type,
+        query_type,
     )?;
 
     Ok(())
@@ -2067,7 +2053,7 @@ fn order_by_emit(
         start_reg,
         result_columns.len(),
         limit.map(|l| (l, metadata.limit_reg.unwrap(), sort_loop_end_label)),
-        &query_type,
+        query_type,
     )?;
 
     program.emit_insn_with_label_dependency(
