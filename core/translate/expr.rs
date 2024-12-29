@@ -1911,6 +1911,7 @@ pub fn translate_expr(
                 }
                 TableReferenceType::Subquery {
                     result_columns_start_reg,
+                    ..
                 } => {
                     program.emit_insn(Insn::Copy {
                         src_reg: result_columns_start_reg + *column,

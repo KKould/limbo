@@ -79,8 +79,12 @@ pub struct GroupByMetadata {
 /// generation process.
 #[derive(Debug)]
 pub struct Metadata {
-    // labels for the instructions that terminate the execution when a conditional check evaluates to false. typically jumps to Halt, but can also jump to AggFinal if a parent in the tree is an aggregation
+    // labels for the instructions that terminate the execution when a conditional check evaluates to false.
+    // this is generically used as a "jump to next phase of the query" in a FIFO manner that handles nested loops etc.
     termination_label_stack: Vec<BranchOffset>,
+    // label for the instruction that jumps to the next phase of the query after the main loop
+    // we don't know ahead of time what that is (GROUP BY, ORDER BY, etc.)
+    after_main_loop_label: Option<BranchOffset>,
     // labels for the instructions that jump to the next row in the current operator.
     // for example, in a join with two nested scans, the inner loop will jump to its Next instruction when the join condition is false;
     // in a join with a scan and a seek, the seek will jump to the scan's Next instruction when the join condition is false.
@@ -132,6 +136,7 @@ fn prologue() -> Result<(ProgramBuilder, Metadata, BranchOffset, BranchOffset)> 
 
     let metadata = Metadata {
         termination_label_stack: vec![halt_label],
+        after_main_loop_label: None,
         group_by_metadata: None,
         left_joins: HashMap::new(),
         next_row_labels: HashMap::new(),
@@ -231,13 +236,14 @@ fn emit_subqueries(
             // Set the result_columns_start_reg in the TableReference object.
             // This is done so that translate_expr() can read the result columns of the subquery,
             // as if it were reading from a regular table.
-            let reg = referenced_tables
+            let table_ref = referenced_tables
                 .iter_mut()
                 .find(|t| t.table_identifier == table_reference.table_identifier)
                 .unwrap();
             if let TableReferenceType::Subquery {
                 result_columns_start_reg,
-            } = &mut reg.reference_type
+                ..
+            } = &mut table_ref.reference_type
             {
                 *result_columns_start_reg = result_columns_start;
             } else {
@@ -269,10 +275,16 @@ fn emit_subqueries(
 /// which can contain even more nested subqueries, etc.
 fn emit_subquery(program: &mut ProgramBuilder, plan: &mut SelectPlan) -> Result<usize> {
     let yield_reg = program.alloc_register();
+    let coroutine_implementation_start_offset = program.offset() + 1;
     match &mut plan.query_type {
-        SelectQueryType::Subquery { yield_reg: y } => {
+        SelectQueryType::Subquery {
+            yield_reg: y,
+            coroutine_implementation_start,
+        } => {
             // The parent query will use this register to jump to/from the subquery.
             *y = yield_reg;
+            // The parent query will use this register to reinitialize the coroutine when it needs to run multiple times.
+            *coroutine_implementation_start = coroutine_implementation_start_offset;
         }
         _ => unreachable!("emit_subquery called on non-subquery"),
     }
@@ -280,6 +292,7 @@ fn emit_subquery(program: &mut ProgramBuilder, plan: &mut SelectPlan) -> Result<
     let mut metadata = Metadata {
         // A regular query ends in a Halt, whereas a subquery ends in an EndCoroutine.
         termination_label_stack: vec![end_coroutine_label],
+        after_main_loop_label: None,
         group_by_metadata: None,
         left_joins: HashMap::new(),
         next_row_labels: HashMap::new(),
@@ -291,12 +304,11 @@ fn emit_subquery(program: &mut ProgramBuilder, plan: &mut SelectPlan) -> Result<
         result_columns_to_skip_in_orderby_sorter: None,
     };
     let subquery_body_end_label = program.allocate_label();
-    let start_offset = program.offset() + 1;
     program.emit_insn_with_label_dependency(
         Insn::InitCoroutine {
             yield_reg: yield_reg,
             jump_on_definition: subquery_body_end_label,
-            start_offset,
+            start_offset: coroutine_implementation_start_offset,
         },
         subquery_body_end_label,
     );
@@ -306,7 +318,7 @@ fn emit_subquery(program: &mut ProgramBuilder, plan: &mut SelectPlan) -> Result<
         yield_reg: yield_reg,
     });
     program.resolve_label(subquery_body_end_label, program.offset());
-    Ok((result_column_start_reg))
+    Ok(result_column_start_reg)
 }
 
 fn emit_query(
@@ -326,6 +338,7 @@ fn emit_query(
     // however an aggregation might still happen,
     // e.g. SELECT COUNT(*) WHERE 0 returns a row with 0, not an empty result set
     let after_main_loop_label = program.allocate_label();
+    metadata.after_main_loop_label = Some(after_main_loop_label);
     if plan.contains_constant_false_condition {
         program.emit_insn_with_label_dependency(
             Insn::Goto {
@@ -363,7 +376,6 @@ fn emit_query(
     init_source(program, &plan.source, metadata, &OperationMode::SELECT)?;
 
     // Set up main query execution loop
-    metadata.termination_label_stack.push(after_main_loop_label);
     open_loop(program, &mut plan.source, &plan.referenced_tables, metadata)?;
 
     // Process result columns and expressions in the inner loop
@@ -372,7 +384,6 @@ fn emit_query(
     // Clean up and close the main execution loop
     close_loop(program, &plan.source, metadata, &plan.referenced_tables)?;
 
-    let after_main_loop_label = metadata.termination_label_stack.pop().unwrap();
     program.resolve_label(after_main_loop_label, program.offset());
 
     let mut order_by_necessary = plan.order_by.is_some() && !plan.contains_constant_false_condition;
@@ -448,7 +459,6 @@ fn emit_program_for_delete(
     )?;
 
     // Set up main query execution loop
-    metadata.termination_label_stack.push(after_main_loop_label);
     open_loop(
         &mut program,
         &mut plan.source,
@@ -466,7 +476,6 @@ fn emit_program_for_delete(
         &plan.referenced_tables,
     )?;
 
-    let after_main_loop_label = metadata.termination_label_stack.pop().unwrap();
     program.resolve_label(after_main_loop_label, program.offset());
 
     // Finalize program
@@ -721,6 +730,9 @@ fn open_loop(
     referenced_tables: &[TableReference],
     metadata: &mut Metadata,
 ) -> Result<()> {
+    metadata
+        .termination_label_stack
+        .push(program.allocate_label());
     match source {
         SourceOperator::Subquery {
             id,
@@ -728,22 +740,31 @@ fn open_loop(
             plan,
             ..
         } => {
-            let yield_reg = match &plan.query_type {
-                SelectQueryType::Subquery { yield_reg } => yield_reg,
+            let (yield_reg, coroutine_implementation_start) = match &plan.query_type {
+                SelectQueryType::Subquery {
+                    yield_reg,
+                    coroutine_implementation_start,
+                } => (*yield_reg, *coroutine_implementation_start),
                 _ => unreachable!("Subquery operator with non-subquery query type"),
             };
+            // In case the subquery is an inner loop, it needs to be reinitialized on each iteration of the outer loop.
+            program.emit_insn(Insn::InitCoroutine {
+                yield_reg,
+                jump_on_definition: 0,
+                start_offset: coroutine_implementation_start as i64,
+            });
             let loop_body_start_label = program.allocate_label();
-            let halt_label = metadata.termination_label_stack.last().unwrap();
             metadata.scan_loop_body_labels.push(loop_body_start_label);
             program.defer_label_resolution(loop_body_start_label, program.offset() as usize);
             // A subquery within the main loop of a parent query has no cursor, so it emits a Yield which
             // jumps back to the main loop of the subquery itself.
+            let termination_label = metadata.termination_label_stack.last().unwrap();
             program.emit_insn_with_label_dependency(
                 Insn::Yield {
-                    yield_reg: *yield_reg,
-                    end_offset: *halt_label,
+                    yield_reg,
+                    end_offset: *termination_label,
                 },
-                *halt_label,
+                *termination_label,
             );
 
             let jump_label = metadata
@@ -788,8 +809,7 @@ fn open_loop(
             let mut jump_target_when_false = *metadata
                 .next_row_labels
                 .get(&right.id())
-                .or(metadata.next_row_labels.get(&left.id()))
-                .unwrap_or(metadata.termination_label_stack.last().unwrap());
+                .expect("right side of join has no next row label");
 
             if *outer {
                 let lj_meta = metadata.left_joins.get(id).unwrap();
@@ -875,7 +895,10 @@ fn open_loop(
             metadata.scan_loop_body_labels.push(scan_loop_body_label);
             program.defer_label_resolution(scan_loop_body_label, program.offset() as usize);
 
-            let jump_label = metadata.next_row_labels.get(id).unwrap_or(halt_label);
+            let jump_label = metadata
+                .next_row_labels
+                .get(id)
+                .expect("scan has no next row label");
             if let Some(preds) = predicates {
                 for expr in preds {
                     let jump_target_when_true = program.allocate_label();
@@ -978,7 +1001,7 @@ fn open_loop(
                 let abort_jump_target = *metadata
                     .next_row_labels
                     .get(id)
-                    .unwrap_or(metadata.termination_label_stack.last().unwrap());
+                    .expect("search operator has no next row label");
                 match cmp_op {
                     ast::Operator::Equals | ast::Operator::LessEquals => {
                         if let Some(index_cursor_id) = index_cursor_id {
@@ -1272,7 +1295,7 @@ fn inner_loop_source_emit(
                 result_columns,
                 metadata.result_column_start_register.unwrap(),
                 None,
-                limit.map(|l| (l, *metadata.termination_label_stack.last().unwrap())),
+                limit.map(|l| (l, metadata.after_main_loop_label.unwrap())),
                 query_type,
             )?;
 
@@ -1309,6 +1332,8 @@ fn close_loop(
                 },
                 jump_label,
             );
+            let termination_label = metadata.termination_label_stack.pop().unwrap();
+            program.resolve_label(termination_label, program.offset());
             Ok(())
         }
         SourceOperator::Join {
@@ -1366,7 +1391,8 @@ fn close_loop(
             }
 
             close_loop(program, left, metadata, referenced_tables)?;
-
+            let termination_label = metadata.termination_label_stack.pop().unwrap();
+            program.resolve_label(termination_label, program.offset());
             Ok(())
         }
         SourceOperator::Scan {
@@ -1407,6 +1433,8 @@ fn close_loop(
                     jump_label,
                 );
             }
+            let termination_label = metadata.termination_label_stack.pop().unwrap();
+            program.resolve_label(termination_label, program.offset());
             Ok(())
         }
         SourceOperator::Search {
@@ -1437,7 +1465,8 @@ fn close_loop(
                 },
                 jump_label,
             );
-
+            let termination_label = metadata.termination_label_stack.pop().unwrap();
+            program.resolve_label(termination_label, program.offset());
             Ok(())
         }
         SourceOperator::Nothing => Ok(()),
@@ -1482,16 +1511,12 @@ fn emit_delete_insns(
             dest: limit_reg,
         });
         program.mark_last_insn_constant();
-        let jump_label_on_limit_reached = metadata
-            .termination_label_stack
-            .last()
-            .expect("termination_label_stack should not be empty.");
         program.emit_insn_with_label_dependency(
             Insn::DecrJumpZero {
                 reg: limit_reg,
-                target_pc: *jump_label_on_limit_reached,
+                target_pc: metadata.after_main_loop_label.unwrap(),
             },
-            *jump_label_on_limit_reached,
+            metadata.after_main_loop_label.unwrap(),
         )
     }
 
@@ -1630,14 +1655,25 @@ fn group_by_emit(
         subroutine_accumulator_output_label,
     );
 
+    let group_by_end_idx = {
+        assert!(metadata.termination_label_stack.len() >= 2);
+        // The reason we take the 2nd-to-last label on the stack is because the top of the stack jumps to
+        // the group by output row subroutine (i.e. emit row for a single group), whereas
+        // the 2nd-to-last label on the stack jumps to the end of the entire group by routine.
+        metadata.termination_label_stack.len() - 2
+    };
+    let termination_label = metadata
+        .termination_label_stack
+        .get(group_by_end_idx)
+        .expect("termination_label_stack should have at least 2 elements");
     program.add_comment(program.offset(), "check abort flag");
     program.emit_insn_with_label_dependency(
         Insn::IfPos {
             reg: abort_flag_register,
-            target_pc: halt_label,
+            target_pc: *termination_label,
             decrement_by: 0,
         },
-        metadata.termination_label_stack[0],
+        *termination_label,
     );
 
     program.add_comment(program.offset(), "goto clear accumulator subroutine");
@@ -1718,17 +1754,6 @@ fn group_by_emit(
     );
 
     program.add_comment(program.offset(), "group by finished");
-    let group_by_end_idx = {
-        assert!(metadata.termination_label_stack.len() >= 2);
-        // The reason we take the 2nd-to-last label on the stack is because the top of the stack jumps to
-        // the group by output row subroutine (i.e. emit row for a single group), whereas
-        // the 2nd-to-last label on the stack jumps to the end of the entire group by routine.
-        metadata.termination_label_stack.len() - 2
-    };
-    let termination_label = metadata
-        .termination_label_stack
-        .get(group_by_end_idx)
-        .expect("termination_label_stack should have at least 2 elements");
     program.emit_insn_with_label_dependency(
         Insn::Goto {
             target_pc: *termination_label,
@@ -2053,7 +2078,7 @@ fn emit_result_row_and_limit(
                 count: result_columns_len,
             });
         }
-        SelectQueryType::Subquery { yield_reg } => {
+        SelectQueryType::Subquery { yield_reg, .. } => {
             program.emit_insn(Insn::Yield {
                 yield_reg: *yield_reg,
                 end_offset: 0,

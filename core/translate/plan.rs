@@ -8,6 +8,7 @@ use std::{
 use crate::{
     function::AggFunc,
     schema::{BTreeTable, Column, Index, Table},
+    vdbe::BranchOffset,
     Result,
 };
 use crate::{
@@ -43,6 +44,8 @@ pub enum SelectQueryType {
     Subquery {
         /// The register that holds the program offset that handles jumping to/from the subquery.
         yield_reg: usize,
+        /// The index of the first instruction in the bytecode that implements the subquery.
+        coroutine_implementation_start: BranchOffset,
     },
 }
 
@@ -227,8 +230,11 @@ pub enum SourceOperator {
 pub enum TableReferenceType {
     /// A BTreeTable is a table that is stored on disk in a B-tree index.
     BTreeTable,
-    /// A subquery. Result_columns_start_reg is the index of the first register in the query plan that contains the result columns of the subquery.
-    Subquery { result_columns_start_reg: usize },
+    /// A subquery.
+    Subquery {
+        /// The index of the first register in the query plan that contains the result columns of the subquery.
+        result_columns_start_reg: usize,
+    },
 }
 
 /// A query plan has a list of TableReference objects, each of which represents a table or subquery.

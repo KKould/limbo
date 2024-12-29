@@ -9,6 +9,7 @@ use crate::{
     function::Func,
     schema::{Schema, Table},
     util::{exprs_are_equivalent, normalize_ident},
+    vdbe::BranchOffset,
     Result,
 };
 use sqlite3_parser::ast::{self, Expr, FromClause, JoinType, Limit, QualifiedName, ResultColumn};
@@ -608,8 +609,9 @@ fn parse_from(
                 unreachable!();
             };
             subplan.query_type = SelectQueryType::Subquery {
-                yield_reg: usize::MAX,
-            }; // will be set later in bytecode emission
+                yield_reg: usize::MAX, // will be set later in bytecode emission
+                coroutine_implementation_start: BranchOffset::MAX, // will be set later in bytecode emission
+            };
             let identifier = maybe_alias
                 .map(|a| match a {
                     ast::As::As(id) => id.0,
@@ -721,8 +723,9 @@ fn parse_join(
                 unreachable!();
             };
             subplan.query_type = SelectQueryType::Subquery {
-                yield_reg: usize::MAX,
-            }; // will be set later in bytecode emission
+                yield_reg: usize::MAX, // will be set later in bytecode emission
+                coroutine_implementation_start: BranchOffset::MAX, // will be set later in bytecode emission
+            };
             let identifier = maybe_alias
                 .map(|a| match a {
                     ast::As::As(id) => id.0,

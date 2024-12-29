@@ -146,3 +146,15 @@ do_execsql_test subquery-outer-grouping {
     ) group by is_jennifer order by count(1) asc
 } {1|151
 0|9849}
+
+do_execsql_test subquery-join-using-with-outer-limit {
+    SELECT p.name, sub.funny_name 
+    FROM products p 
+    JOIN (
+        select id, concat(name, '-lol') as funny_name 
+        from products
+    ) sub USING (id) 
+    LIMIT 3;
+} {"hat|hat-lol
+cap|cap-lol
+shirt|shirt-lol"}
