@@ -572,6 +572,7 @@ fn parse_from(
     let mut tables = vec![];
 
     let (first_table, mut operator) = match *from.select.unwrap() {
+        // A table reference in the FROM clause
         ast::SelectTable::Table(qualified_name, maybe_alias, _) => {
             let normalized_qualified_name = normalize_ident(qualified_name.name.0.as_str());
             let Some(table) = schema.get_table(&normalized_qualified_name) else {
@@ -601,6 +602,7 @@ fn parse_from(
                 },
             )
         }
+        // A subquery in the FROM clause
         ast::SelectTable::Select(subselect, maybe_alias) => {
             let Plan::Select(mut subplan) = prepare_select_plan(schema, subselect)? else {
                 unreachable!();
@@ -686,6 +688,7 @@ fn parse_join(
     } = join;
 
     let source_operator = match table {
+        // ... JOIN with a table reference e.g. SELECT * FROM t1 JOIN t2
         ast::SelectTable::Table(qualified_name, maybe_alias, _) => {
             let normalized_name = normalize_ident(qualified_name.name.0.as_str());
             let Some(table) = schema.get_table(&normalized_name) else {
@@ -712,6 +715,7 @@ fn parse_join(
                 iter_dir: None,
             }
         }
+        // ... JOIN with a subquery: e.g. SELECT * FROM t1 JOIN (SELECT * FROM t2)
         ast::SelectTable::Select(subselect, maybe_alias) => {
             let Plan::Select(mut subplan) = prepare_select_plan(schema, subselect)? else {
                 unreachable!();

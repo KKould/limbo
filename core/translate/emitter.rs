@@ -212,6 +212,8 @@ fn emit_program_for_select(
     Ok(program.build(database_header, connection))
 }
 
+/// Emit the subqueries contained in the FROM clause.
+/// This is done first so the results can be read in the main query loop.
 fn emit_subqueries(
     program: &mut ProgramBuilder,
     referenced_tables: &mut [TableReference],
@@ -224,7 +226,11 @@ fn emit_subqueries(
             plan,
             ..
         } => {
+            // Emit the subquery and get the start register of the result columns.
             let result_columns_start = emit_subquery(program, plan)?;
+            // Set the result_columns_start_reg in the TableReference object.
+            // This is done so that translate_expr() can read the result columns of the subquery,
+            // as if it were reading from a regular table.
             let reg = referenced_tables
                 .iter_mut()
                 .find(|t| t.table_identifier == table_reference.table_identifier)
@@ -248,16 +254,31 @@ fn emit_subqueries(
     }
 }
 
+/// Emit a subquery and return the start register of the result columns.
+/// This is done by emitting a coroutine that stores the result columns in sequential registers.
+/// Each subquery in a FROM clause has its own separate SelectPlan which is wrapped in a coroutine.
+///
+/// The resulting bytecode from a subquery is mostly exactly the same as a regular query, except:
+/// - it ends in an EndCoroutine instead of a Halt.
+/// - instead of emitting ResultRows, the coroutine yields to the main query loop.
+/// - the first register of the result columns is returned to the parent query,
+///   so that translate_expr() can read the result columns of the subquery,
+///   as if it were reading from a regular table.
+///
+/// Since a subquery has its own SelectPlan, it can contain nested subqueries,
+/// which can contain even more nested subqueries, etc.
 fn emit_subquery(program: &mut ProgramBuilder, plan: &mut SelectPlan) -> Result<usize> {
     let yield_reg = program.alloc_register();
     match &mut plan.query_type {
         SelectQueryType::Subquery { yield_reg: y } => {
+            // The parent query will use this register to jump to/from the subquery.
             *y = yield_reg;
         }
         _ => unreachable!("emit_subquery called on non-subquery"),
     }
     let end_coroutine_label = program.allocate_label();
     let mut metadata = Metadata {
+        // A regular query ends in a Halt, whereas a subquery ends in an EndCoroutine.
         termination_label_stack: vec![end_coroutine_label],
         group_by_metadata: None,
         left_joins: HashMap::new(),
@@ -293,7 +314,7 @@ fn emit_query(
     plan: &mut SelectPlan,
     metadata: &mut Metadata,
 ) -> Result<usize> {
-    // Emit subqueries
+    // Emit subqueries first so the results can be read in the main query loop.
     emit_subqueries(
         program,
         &mut plan.referenced_tables,
@@ -715,6 +736,8 @@ fn open_loop(
             let halt_label = metadata.termination_label_stack.last().unwrap();
             metadata.scan_loop_body_labels.push(loop_body_start_label);
             program.defer_label_resolution(loop_body_start_label, program.offset() as usize);
+            // A subquery within the main loop of a parent query has no cursor, so it emits a Yield which
+            // jumps back to the main loop of the subquery itself.
             program.emit_insn_with_label_dependency(
                 Insn::Yield {
                     yield_reg: *yield_reg,
@@ -727,6 +750,10 @@ fn open_loop(
                 .next_row_labels
                 .get(id)
                 .expect("subquery has no next row label");
+
+            // These are predicates evaluated outside of the subquery,
+            // so they are translated here.
+            // E.g. SELECT foo FROM (SELECT bar as foo FROM t1) sub WHERE sub.foo > 10
             if let Some(preds) = predicates {
                 for expr in preds {
                     let jump_target_when_true = program.allocate_label();
@@ -1064,7 +1091,7 @@ fn open_loop(
 /// - a GROUP BY sorter (grouping is done by sorting based on the GROUP BY keys and aggregating while the GROUP BY keys match)
 /// - an ORDER BY sorter (when there is no GROUP BY, but there is an ORDER BY)
 /// - an AggStep (the columns are collected for aggregation, which is finished later)
-/// - a ResultRow (there is none of the above, so the loop emits a result row directly)
+/// - a QueryResult (there is none of the above, so the loop either emits a ResultRow, or if it's a subquery, yields to the parent query)
 pub enum InnerLoopEmitTarget<'a> {
     GroupBySorter {
         group_by: &'a GroupBy,
@@ -1074,7 +1101,7 @@ pub enum InnerLoopEmitTarget<'a> {
         order_by: &'a Vec<(ast::Expr, Direction)>,
     },
     AggStep,
-    ResultRow {
+    QueryResult {
         query_type: &'a SelectQueryType,
         limit: Option<usize>,
     },
@@ -1130,7 +1157,7 @@ fn inner_loop_emit(
         &plan.result_columns,
         &plan.aggregates,
         metadata,
-        InnerLoopEmitTarget::ResultRow {
+        InnerLoopEmitTarget::QueryResult {
             query_type: &plan.query_type,
             limit: plan.limit,
         },
@@ -1234,7 +1261,7 @@ fn inner_loop_source_emit(
             }
             Ok(())
         }
-        InnerLoopEmitTarget::ResultRow { query_type, limit } => {
+        InnerLoopEmitTarget::QueryResult { query_type, limit } => {
             assert!(
                 aggregates.is_empty(),
                 "We should not get here with aggregates"
@@ -1273,6 +1300,9 @@ fn close_loop(
                 program.offset(),
             );
             let jump_label = metadata.scan_loop_body_labels.pop().unwrap();
+            // A subquery has no cursor to call NextAsync on, so it just emits a Goto
+            // to the Yield instruction, which in turn jumps back to the main loop of the subquery,
+            // so that the next row from the subquery can be read.
             program.emit_insn_with_label_dependency(
                 Insn::Goto {
                     target_pc: jump_label,
@@ -2006,7 +2036,9 @@ fn order_by_emit(
     Ok(())
 }
 
-/// Emits the bytecode for: result row and limit.
+/// Emits the bytecode for:
+/// - result row (or if a subquery, yields to the parent query)
+/// - limit
 fn emit_result_row_and_limit(
     program: &mut ProgramBuilder,
     start_reg: usize,
@@ -2047,7 +2079,10 @@ fn emit_result_row_and_limit(
     Ok(())
 }
 
-/// Emits the bytecode for: all result columns, result row, and limit.
+/// Emits the bytecode for:
+/// - all result columns
+/// - result row (or if a subquery, yields to the parent query)
+/// - limit
 fn emit_select_result(
     program: &mut ProgramBuilder,
     referenced_tables: &[TableReference],

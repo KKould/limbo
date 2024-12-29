@@ -36,10 +36,14 @@ pub enum Plan {
     Delete(DeletePlan),
 }
 
+/// The type of the query, either top level or subquery
 #[derive(Debug, Clone)]
 pub enum SelectQueryType {
     TopLevel,
-    Subquery { yield_reg: usize },
+    Subquery {
+        /// The register that holds the program offset that handles jumping to/from the subquery.
+        yield_reg: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -218,17 +222,27 @@ pub enum SourceOperator {
     Nothing,
 }
 
+/// The type of the table reference, either BTreeTable or Subquery
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TableReferenceType {
+    /// A BTreeTable is a table that is stored on disk in a B-tree index.
     BTreeTable,
+    /// A subquery. Result_columns_start_reg is the index of the first register in the query plan that contains the result columns of the subquery.
     Subquery { result_columns_start_reg: usize },
 }
 
+/// A query plan has a list of TableReference objects, each of which represents a table or subquery.
 #[derive(Clone, Debug)]
 pub struct TableReference {
+    /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
+    /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
     pub table_identifier: String,
+    /// The index of this reference in the list of TableReference objects in the query plan
+    /// The reference at index 0 is the first table in the FROM clause, the reference at index 1 is the second table in the FROM clause, etc.
+    /// So, the index is relevant for determining when predicates (WHERE, ON filters etc.) should be evaluated.
     pub table_index: usize,
+    /// The type of the table reference, either BTreeTable or Subquery
     pub reference_type: TableReferenceType,
 }
 
