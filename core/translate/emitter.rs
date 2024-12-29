@@ -1355,9 +1355,6 @@ fn close_loop(
                 },
                 jump_label,
             );
-            let termination_label = metadata.termination_label_stack.pop().unwrap();
-            program.resolve_label(termination_label, program.offset());
-            Ok(())
         }
         SourceOperator::Join {
             id,
@@ -1414,9 +1411,6 @@ fn close_loop(
             }
 
             close_loop(program, left, metadata, referenced_tables)?;
-            let termination_label = metadata.termination_label_stack.pop().unwrap();
-            program.resolve_label(termination_label, program.offset());
-            Ok(())
         }
         SourceOperator::Scan {
             id,
@@ -1456,9 +1450,6 @@ fn close_loop(
                     jump_label,
                 );
             }
-            let termination_label = metadata.termination_label_stack.pop().unwrap();
-            program.resolve_label(termination_label, program.offset());
-            Ok(())
         }
         SourceOperator::Search {
             id,
@@ -1488,12 +1479,13 @@ fn close_loop(
                 },
                 jump_label,
             );
-            let termination_label = metadata.termination_label_stack.pop().unwrap();
-            program.resolve_label(termination_label, program.offset());
-            Ok(())
         }
-        SourceOperator::Nothing => Ok(()),
-    }
+        SourceOperator::Nothing => {}
+    };
+
+    let termination_label = metadata.termination_label_stack.pop().unwrap();
+    program.resolve_label(termination_label, program.offset());
+    Ok(())
 }
 
 fn emit_delete_insns(
