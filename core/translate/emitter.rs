@@ -306,7 +306,7 @@ fn emit_subquery(program: &mut ProgramBuilder, plan: &mut SelectPlan) -> Result<
         result_column_start_register: None,
         result_column_indexes_in_orderby_sorter: HashMap::new(),
         result_columns_to_skip_in_orderby_sorter: None,
-        limit_reg: plan.limit.map(|l| program.alloc_register()),
+        limit_reg: plan.limit.map(|_| program.alloc_register()),
     };
     let subquery_body_end_label = program.allocate_label();
     program.emit_insn_with_label_dependency(

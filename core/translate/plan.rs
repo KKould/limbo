@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     function::AggFunc,
-    schema::{BTreeTable, Column, Index, Table},
+    schema::{Column, Index, Table},
     vdbe::BranchOffset,
     Result,
 };
