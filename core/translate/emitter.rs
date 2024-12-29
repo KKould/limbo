@@ -79,8 +79,8 @@ pub struct GroupByMetadata {
 /// generation process.
 #[derive(Debug)]
 pub struct Metadata {
-    // labels for the instructions that terminate the execution when a conditional check evaluates to false.
-    // this is generically used as a "jump to next phase of the query" in a FIFO manner that handles nested loops etc.
+    // this stack is generically used for a "jump to the end of the current query phase" purpose in a FIFO manner.
+    // For example, in a nested loop join, each loop will have a label signifying the end of that particular loop.
     termination_label_stack: Vec<BranchOffset>,
     // label for the instruction that jumps to the next phase of the query after the main loop
     // we don't know ahead of time what that is (GROUP BY, ORDER BY, etc.)
@@ -88,6 +88,8 @@ pub struct Metadata {
     // labels for the instructions that jump to the next row in the current operator.
     // for example, in a join with two nested scans, the inner loop will jump to its Next instruction when the join condition is false;
     // in a join with a scan and a seek, the seek will jump to the scan's Next instruction when the join condition is false.
+    // The difference between next_row_labels and termination_label_stack is that next_row_labels are used to jump to the next row in the
+    // current loop, whereas termination_label_stack is used to jump OUT of the current loop entirely.
     next_row_labels: HashMap<usize, BranchOffset>,
     // labels for the instructions beginning the inner loop of a scan operator.
     scan_loop_body_labels: Vec<BranchOffset>,
@@ -773,17 +775,22 @@ fn open_loop(
             let loop_body_start_label = program.allocate_label();
             metadata.scan_loop_body_labels.push(loop_body_start_label);
             program.defer_label_resolution(loop_body_start_label, program.offset() as usize);
-            // A subquery within the main loop of a parent query has no cursor, so it emits a Yield which
-            // jumps back to the main loop of the subquery itself.
-            let termination_label = metadata.termination_label_stack.last().unwrap();
+            // A subquery within the main loop of a parent query has no cursor, so instead of advancing the cursor,
+            // it emits a Yield which jumps back to the main loop of the subquery itself to retrieve the next row.
+            // When the subquery coroutine completes, this instruction jumps to the label at the top of the termination_label_stack,
+            // which in this case is the end of the Yield-Goto loop in the parent query.
+            let end_of_loop_label = *metadata.termination_label_stack.last().unwrap();
             program.emit_insn_with_label_dependency(
                 Insn::Yield {
                     yield_reg,
-                    end_offset: *termination_label,
+                    end_offset: end_of_loop_label,
                 },
-                *termination_label,
+                end_of_loop_label,
             );
 
+            // In case we have predicates on the subquery results that evaluate to false,
+            // (e.g. SELECT foo FROM (SELECT bar as foo FROM t1) sub WHERE sub.foo > 10)
+            // we jump to the Goto instruction below to move on to the next row from the subquery.
             let jump_label = metadata
                 .next_row_labels
                 .get(id)
@@ -891,7 +898,9 @@ fn open_loop(
                 program.emit_insn(Insn::RewindAsync { cursor_id });
             }
             let scan_loop_body_label = program.allocate_label();
-            let halt_label = metadata.termination_label_stack.last().unwrap();
+
+            // If the table this cursor is scanning is entirely empty, we exit this loop entirely.
+            let end_of_loop_label = metadata.termination_label_stack.last().unwrap();
             program.emit_insn_with_label_dependency(
                 if iter_dir
                     .as_ref()
@@ -899,15 +908,15 @@ fn open_loop(
                 {
                     Insn::LastAwait {
                         cursor_id,
-                        pc_if_empty: *halt_label,
+                        pc_if_empty: *end_of_loop_label,
                     }
                 } else {
                     Insn::RewindAwait {
                         cursor_id,
-                        pc_if_empty: *halt_label,
+                        pc_if_empty: *end_of_loop_label,
                     }
                 },
-                *halt_label,
+                *end_of_loop_label,
             );
             metadata.scan_loop_body_labels.push(scan_loop_body_label);
             program.defer_label_resolution(scan_loop_body_label, program.offset() as usize);
@@ -978,6 +987,8 @@ fn open_loop(
                     }
                     _ => unreachable!(),
                 }
+                // If we try to seek to a key that is not present in the table/index, we exit the loop entirely.
+                let end_of_loop_label = *metadata.termination_label_stack.last().unwrap();
                 program.emit_insn_with_label_dependency(
                     match cmp_op {
                         ast::Operator::Equals | ast::Operator::GreaterEquals => Insn::SeekGE {
@@ -985,7 +996,7 @@ fn open_loop(
                             cursor_id: index_cursor_id.unwrap_or(table_cursor_id),
                             start_reg: cmp_reg,
                             num_regs: 1,
-                            target_pc: *metadata.termination_label_stack.last().unwrap(),
+                            target_pc: end_of_loop_label,
                         },
                         ast::Operator::Greater
                         | ast::Operator::Less
@@ -994,11 +1005,11 @@ fn open_loop(
                             cursor_id: index_cursor_id.unwrap_or(table_cursor_id),
                             start_reg: cmp_reg,
                             num_regs: 1,
-                            target_pc: *metadata.termination_label_stack.last().unwrap(),
+                            target_pc: end_of_loop_label,
                         },
                         _ => unreachable!(),
                     },
-                    *metadata.termination_label_stack.last().unwrap(),
+                    end_of_loop_label,
                 );
                 if *cmp_op == ast::Operator::Less || *cmp_op == ast::Operator::LessEquals {
                     translate_expr(program, Some(referenced_tables), cmp_expr, cmp_reg, None)?;
@@ -1483,8 +1494,8 @@ fn close_loop(
         SourceOperator::Nothing => {}
     };
 
-    let termination_label = metadata.termination_label_stack.pop().unwrap();
-    program.resolve_label(termination_label, program.offset());
+    let end_of_loop_label = metadata.termination_label_stack.pop().unwrap();
+    program.resolve_label(end_of_loop_label, program.offset());
     Ok(())
 }
 
@@ -1570,7 +1581,6 @@ fn group_by_emit(
         sorter_key_register,
         ..
     } = *group_by_metadata;
-    let halt_label = *metadata.termination_label_stack.first().unwrap();
 
     // all group by columns and all arguments of agg functions are in the sorter.
     // the sort keys are the group by columns (the aggregation within groups is done based on how long the sort keys remain the same)
@@ -1677,18 +1687,18 @@ fn group_by_emit(
         // the 2nd-to-last label on the stack jumps to the end of the entire group by routine.
         metadata.termination_label_stack.len() - 2
     };
-    let termination_label = metadata
+    let group_by_end_label = *metadata
         .termination_label_stack
         .get(group_by_end_idx)
-        .expect("termination_label_stack should have at least 2 elements");
+        .unwrap();
     program.add_comment(program.offset(), "check abort flag");
     program.emit_insn_with_label_dependency(
         Insn::IfPos {
             reg: abort_flag_register,
-            target_pc: *termination_label,
+            target_pc: group_by_end_label,
             decrement_by: 0,
         },
-        *termination_label,
+        group_by_end_label,
     );
 
     program.add_comment(program.offset(), "goto clear accumulator subroutine");
@@ -1771,9 +1781,9 @@ fn group_by_emit(
     program.add_comment(program.offset(), "group by finished");
     program.emit_insn_with_label_dependency(
         Insn::Goto {
-            target_pc: *termination_label,
+            target_pc: group_by_end_label,
         },
-        *termination_label,
+        group_by_end_label,
     );
     program.emit_insn(Insn::Integer {
         value: 1,
@@ -1789,14 +1799,14 @@ fn group_by_emit(
     );
 
     program.add_comment(program.offset(), "output group by row subroutine start");
-    let termination_label = *metadata.termination_label_stack.last().unwrap();
+    let output_group_by_row_label = metadata.termination_label_stack.pop().unwrap();
     program.emit_insn_with_label_dependency(
         Insn::IfPos {
             reg: group_by_metadata.data_in_accumulator_indicator_register,
-            target_pc: termination_label,
+            target_pc: output_group_by_row_label,
             decrement_by: 0,
         },
-        termination_label,
+        output_group_by_row_label,
     );
     let group_by_end_without_emitting_row_label = program.allocate_label();
     program.defer_label_resolution(
@@ -1809,13 +1819,7 @@ fn group_by_emit(
 
     let agg_start_reg = metadata.aggregation_start_register.unwrap();
     // Resolve the label for the start of the group by output row subroutine
-    program.resolve_label(
-        metadata
-            .termination_label_stack
-            .pop()
-            .expect("termination_label_stack should not be empty"),
-        program.offset(),
-    );
+    program.resolve_label(output_group_by_row_label, program.offset());
     for (i, agg) in aggregates.iter().enumerate() {
         let agg_result_reg = agg_start_reg + i;
         program.emit_insn(Insn::AggFinal {
@@ -1911,10 +1915,7 @@ fn group_by_emit(
         metadata.termination_label_stack.len() >= 2,
         "termination_label_stack should have at least 2 elements"
     );
-    let group_by_end_label = metadata
-        .termination_label_stack
-        .pop()
-        .expect("termination_label_stack should not be empty");
+    let group_by_end_label = metadata.termination_label_stack.pop().unwrap();
     program.resolve_label(group_by_end_label, program.offset());
 
     Ok(())
