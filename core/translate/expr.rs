@@ -1891,6 +1891,8 @@ pub fn translate_expr(
         } => {
             let tbl_ref = referenced_tables.as_ref().unwrap().get(*table).unwrap();
             match tbl_ref.reference_type {
+                // If we are reading a column from a table, we find the cursor that corresponds to
+                // the table and read the column from the cursor.
                 TableReferenceType::BTreeTable => {
                     let cursor_id = program.resolve_cursor_id(&tbl_ref.table_identifier);
                     if *is_rowid_alias {
@@ -1909,6 +1911,8 @@ pub fn translate_expr(
                     maybe_apply_affinity(column.ty, target_register, program);
                     Ok(target_register)
                 }
+                // If we are reading a column from a subquery, we instead copy the column from the
+                // subquery's result registers.
                 TableReferenceType::Subquery {
                     result_columns_start_reg,
                     ..
@@ -2525,6 +2529,10 @@ pub fn translate_aggregation_groupby(
     Ok(dest)
 }
 
+/// Get an appropriate name for an expression.
+/// If the query provides an alias (e.g. `SELECT a AS b FROM t`), use that (e.g. `b`).
+/// If the expression is a column from a table, use the column name (e.g. `a`).
+/// Otherwise we just use a generic fallback name (e.g. `expr_<index>`).
 pub fn get_name(
     maybe_alias: Option<&ast::As>,
     expr: &ast::Expr,
