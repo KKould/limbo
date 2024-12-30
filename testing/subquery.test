@@ -182,3 +182,13 @@ do_execsql_test subquery-join-using-with-both-limits {
     LIMIT 2;
 } {"hat|hat-lol
 cap|cap-lol"}
+
+do_execsql_test subquery-containing-join {
+    select foo, bar 
+    from (
+        select p.name as foo, u.first_name as bar 
+        from products p join users u using (id)
+    ) limit 3;
+} {hat|Jamie
+cap|Cindy
+shirt|Tommy}
