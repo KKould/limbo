@@ -556,24 +556,13 @@ pub fn prepare_delete_plan(
     Ok(Plan::Delete(plan))
 }
 
-#[allow(clippy::type_complexity)]
-fn parse_from(
+fn parse_from_clause_table(
     schema: &Schema,
-    from: Option<FromClause>,
+    table: ast::SelectTable,
     operator_id_counter: &mut OperatorIdCounter,
-) -> Result<(SourceOperator, Vec<TableReference>)> {
-    if from.as_ref().and_then(|f| f.select.as_ref()).is_none() {
-        return Ok((SourceOperator::Nothing, vec![]));
-    }
-
-    let from = from.unwrap();
-
-    let mut table_index = 0;
-
-    let mut tables = vec![];
-
-    let (first_table, mut operator) = match *from.select.unwrap() {
-        // A table reference in the FROM clause
+    cur_table_index: usize,
+) -> Result<(TableReference, SourceOperator)> {
+    match table {
         ast::SelectTable::Table(qualified_name, maybe_alias, _) => {
             let normalized_qualified_name = normalize_ident(qualified_name.name.0.as_str());
             let Some(table) = schema.get_table(&normalized_qualified_name) else {
@@ -585,25 +574,22 @@ fn parse_from(
                     ast::As::Elided(id) => id,
                 })
                 .map(|a| a.0);
-
-            let btree_table_reference = TableReference {
+            let table_reference = TableReference {
                 table: Table::BTree(table.clone()),
                 table_identifier: alias.unwrap_or(normalized_qualified_name),
-                table_index: 0,
+                table_index: cur_table_index,
                 reference_type: TableReferenceType::BTreeTable,
             };
-            tables.push(btree_table_reference.clone());
-            (
-                btree_table_reference.clone(),
+            Ok((
+                table_reference.clone(),
                 SourceOperator::Scan {
-                    table_reference: btree_table_reference.clone(),
+                    table_reference,
                     predicates: None,
                     id: operator_id_counter.get_next_id(),
                     iter_dir: None,
                 },
-            )
+            ))
         }
-        // A subquery in the FROM clause
         ast::SelectTable::Select(subselect, maybe_alias) => {
             let Plan::Select(mut subplan) = prepare_select_plan(schema, subselect)? else {
                 unreachable!();
@@ -614,31 +600,49 @@ fn parse_from(
             };
             let identifier = maybe_alias
                 .map(|a| match a {
-                    ast::As::As(id) => id.0,
-                    ast::As::Elided(id) => id.0,
+                    ast::As::As(id) => id.0.clone(),
+                    ast::As::Elided(id) => id.0.clone(),
                 })
-                .unwrap_or(format!("subquery_{}", table_index));
-
-            let source_reference =
-                TableReference::new_subquery(identifier.clone(), table_index, &subplan);
-            tables.push(source_reference.clone());
-            (
-                source_reference.clone(),
+                .unwrap_or(format!("subquery_{}", cur_table_index));
+            let table_reference =
+                TableReference::new_subquery(identifier.clone(), cur_table_index, &subplan);
+            Ok((
+                table_reference.clone(),
                 SourceOperator::Subquery {
                     id: operator_id_counter.get_next_id(),
-                    table_reference: source_reference,
+                    table_reference: table_reference,
                     plan: Box::new(subplan),
                     predicates: None,
                 },
-            )
+            ))
         }
-        other => todo!("Unsupported FROM clause: {:?}", other),
-    };
+        _ => todo!(),
+    }
+}
 
-    let mut tables = vec![first_table];
+#[allow(clippy::type_complexity)]
+fn parse_from(
+    schema: &Schema,
+    mut from: Option<FromClause>,
+    operator_id_counter: &mut OperatorIdCounter,
+) -> Result<(SourceOperator, Vec<TableReference>)> {
+    if from.as_ref().and_then(|f| f.select.as_ref()).is_none() {
+        return Ok((SourceOperator::Nothing, vec![]));
+    }
+
+    let mut table_index = 0;
+    let mut tables = vec![];
+
+    let mut from_owned = std::mem::take(&mut from).unwrap();
+    let select_owned = *std::mem::take(&mut from_owned.select).unwrap();
+    let joins_owned = std::mem::take(&mut from_owned.joins).unwrap_or_default();
+    let (table_reference, mut operator) =
+        parse_from_clause_table(schema, select_owned, operator_id_counter, table_index)?;
+
+    tables.push(table_reference);
     table_index += 1;
 
-    for join in from.joins.unwrap_or_default().into_iter() {
+    for join in joins_owned.into_iter() {
         let (right, outer, using, predicates) =
             parse_join(schema, join, operator_id_counter, &mut tables, table_index)?;
         operator = SourceOperator::Join {
@@ -684,70 +688,17 @@ fn parse_join(
     Option<Vec<ast::Expr>>,
 )> {
     let ast::JoinedSelectTable {
-        operator,
+        operator: join_operator,
         table,
         constraint,
     } = join;
 
-    let source_operator = match table {
-        // ... JOIN with a table reference e.g. SELECT * FROM t1 JOIN t2
-        ast::SelectTable::Table(qualified_name, maybe_alias, _) => {
-            let normalized_name = normalize_ident(qualified_name.name.0.as_str());
-            let Some(table) = schema.get_table(&normalized_name) else {
-                crate::bail_parse_error!("Table {} not found", normalized_name);
-            };
-            let alias = maybe_alias
-                .map(|a| match a {
-                    ast::As::As(id) => id,
-                    ast::As::Elided(id) => id,
-                })
-                .map(|a| a.0);
-            let table_ref = TableReference {
-                table: Table::BTree(table.clone()),
-                table_identifier: alias.unwrap_or(normalized_name),
-                table_index,
-                reference_type: TableReferenceType::BTreeTable,
-            };
-            tables.push(table_ref.clone());
+    let (table_reference, source_operator) =
+        parse_from_clause_table(schema, table, operator_id_counter, table_index)?;
 
-            SourceOperator::Scan {
-                table_reference: table_ref,
-                predicates: None,
-                id: operator_id_counter.get_next_id(),
-                iter_dir: None,
-            }
-        }
-        // ... JOIN with a subquery: e.g. SELECT * FROM t1 JOIN (SELECT * FROM t2)
-        ast::SelectTable::Select(subselect, maybe_alias) => {
-            let Plan::Select(mut subplan) = prepare_select_plan(schema, subselect)? else {
-                unreachable!();
-            };
-            subplan.query_type = SelectQueryType::Subquery {
-                yield_reg: usize::MAX, // will be set later in bytecode emission
-                coroutine_implementation_start: BranchOffset::MAX, // will be set later in bytecode emission
-            };
-            let identifier = maybe_alias
-                .map(|a| match a {
-                    ast::As::As(id) => id.0,
-                    ast::As::Elided(id) => id.0,
-                })
-                .unwrap_or(format!("subquery_{}", table_index));
+    tables.push(table_reference);
 
-            let source_reference =
-                TableReference::new_subquery(identifier.clone(), table_index, &subplan);
-            tables.push(source_reference.clone());
-
-            SourceOperator::Subquery {
-                id: operator_id_counter.get_next_id(),
-                table_reference: source_reference,
-                plan: Box::new(subplan),
-                predicates: None,
-            }
-        }
-        _ => todo!("Unsupported table reference in JOIN: {:?}", table),
-    };
-
-    let (outer, natural) = match operator {
+    let (outer, natural) = match join_operator {
         ast::JoinOperator::TypedJoin(Some(join_type)) => {
             let is_outer = join_type.contains(JoinType::OUTER);
             let is_natural = join_type.contains(JoinType::NATURAL);
